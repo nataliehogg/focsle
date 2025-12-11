@@ -60,7 +60,7 @@ def plot_fisher_ellipse(
     # Plot contours
     sigmas = [1, 2] if show_2sigma else [1]
     alphas = [alpha_1sig, alpha_2sig]
-    linestyles = [linestyle, '--']
+    linestyles = [linestyle, '-']
 
     for i, n_sigma in enumerate(sigmas):
         width = 2 * n_sigma * np.sqrt(eigenvalues[0])

@@ -179,38 +179,53 @@ class TheoryJAX:
             print("  sigma_8 mapping stored for each (Omega_m, A_s) grid point")
 
         # Also setup background cosmology interpolators
-        self._setup_background(verbose=verbose)
+        self._setup_background(Om_grid, verbose=verbose)
 
-    def _setup_background(self, verbose: bool = True):
-        """Setup background cosmology (chi(z) etc) using fiducial."""
-        pars = camb.CAMBparams()
-        pars.set_cosmology(
-            H0=self.cosmo_fid['H0'],
-            ombh2=self.cosmo_fid['ombh2'],
-            omch2=self.cosmo_fid['omch2'],
-            mnu=self.cosmo_fid['mnu']
-        )
-
+    def _setup_background(self, Om_grid, verbose: bool = True):
+        """Setup background cosmology table chi(z) over Omega_m grid."""
         z_arr = np.linspace(0, 7, 500)
-        bg = camb.get_background(pars)
-        chi_arr = bg.comoving_radial_distance(z_arr)  # Mpc
+        chi_table = np.zeros((len(Om_grid), len(z_arr)))
 
-        # Store as JAX arrays
+        for i, Om in enumerate(Om_grid):
+            pars = camb.CAMBparams()
+            pars.set_cosmology(
+                H0=self.cosmo_fid['H0'],
+                ombh2=self.cosmo_fid['ombh2'],
+                omch2=Om * (self.cosmo_fid['H0'] / 100) ** 2 - self.cosmo_fid['ombh2'],
+                mnu=self.cosmo_fid['mnu'],
+                omk=self.cosmo_fid['omk'],
+            )
+            bg = camb.get_background(pars)
+            chi_table[i, :] = bg.comoving_radial_distance(z_arr)
+
         self.z_bg = jnp.array(z_arr)
-        self.chi_bg = jnp.array(chi_arr)
+        self.Om_bg = jnp.array(Om_grid)
+        self.chi_bg_table = jnp.array(chi_table)
 
         if verbose:
-            print("Background cosmology ready on GPU")
+            print("Background cosmology table ready on GPU")
 
     @partial(jit, static_argnums=(0,))
-    def chi_of_z(self, z):
-        """Comoving distance (Mpc) as function of redshift - JAX interpolation."""
-        return jnp.interp(z, self.z_bg, self.chi_bg)
+    def chi_of_z(self, Om, z):
+        """Comoving distance (Mpc) as function of redshift with Omega_m dependence."""
+        iOm = (Om - self.Om_bg[0]) / (self.Om_bg[-1] - self.Om_bg[0]) * (len(self.Om_bg) - 1)
+        iOm = jnp.clip(iOm, 0.0, len(self.Om_bg) - 1.001)
+        Om_low = jnp.floor(iOm).astype(int)
+        Om_high = jnp.minimum(Om_low + 1, len(self.Om_bg) - 1)
+        t_Om = iOm - Om_low
+        chi_row = (1.0 - t_Om) * self.chi_bg_table[Om_low, :] + t_Om * self.chi_bg_table[Om_high, :]
+        return jnp.interp(z, self.z_bg, chi_row)
 
     @partial(jit, static_argnums=(0,))
-    def z_of_chi(self, chi):
-        """Redshift as function of comoving distance - JAX interpolation."""
-        return jnp.interp(chi, self.chi_bg, self.z_bg)
+    def z_of_chi(self, Om, chi):
+        """Redshift as function of comoving distance with Omega_m dependence."""
+        iOm = (Om - self.Om_bg[0]) / (self.Om_bg[-1] - self.Om_bg[0]) * (len(self.Om_bg) - 1)
+        iOm = jnp.clip(iOm, 0.0, len(self.Om_bg) - 1.001)
+        Om_low = jnp.floor(iOm).astype(int)
+        Om_high = jnp.minimum(Om_low + 1, len(self.Om_bg) - 1)
+        t_Om = iOm - Om_low
+        chi_row = (1.0 - t_Om) * self.chi_bg_table[Om_low, :] + t_Om * self.chi_bg_table[Om_high, :]
+        return jnp.interp(chi, chi_row, self.z_bg)
 
     @partial(jit, static_argnums=(0,))
     def Pk_interp(self, Om, s8, z, k):
@@ -282,8 +297,9 @@ class TheoryJAX:
             print("Pre-computing mean Q_L kernel...")
 
         # Convert lens arrays to numpy for this computation
-        chi_d_np = np.array(self.chi_of_z(jnp.array(self.z_d_array)))
-        chi_s_np = np.array(self.chi_of_z(jnp.array(self.z_s_array)))
+        Om_fid = self.cosmo_fid['Omega_m']
+        chi_d_np = np.array(self.chi_of_z(Om_fid, jnp.array(self.z_d_array)))
+        chi_s_np = np.array(self.chi_of_z(Om_fid, jnp.array(self.z_s_array)))
 
         for j, chi in enumerate(chi_grid_np):
             for i in range(self.N_lenses):
@@ -296,7 +312,7 @@ class TheoryJAX:
                 else:
                     K = (chi_s - chi_d) / chi
 
-                z_chi = np.interp(chi, np.array(self.chi_bg), np.array(self.z_bg))
+                z_chi = np.interp(chi, np.array(self.chi_bg_table)[0], np.array(self.z_bg))
                 prefactor = -(3.0 / 2.0) * self.cosmo_fid['Omega_m'] * \
                            (self.cosmo_fid['H0'] ** 2) / (self.c_km_s ** 2)
                 Q_L_val = prefactor * (1 + z_chi) * K
@@ -313,14 +329,15 @@ class TheoryJAX:
             print(f"  Mean Q_L ready on GPU ({nchi} points)")
 
     @partial(jit, static_argnums=(0,))
-    def QL_mean(self, chi):
-        """Mean Q_L kernel - JAX interpolation."""
-        return jnp.interp(chi, self.chi_QL_grid, self.QL_mean_grid)
+    def QL_mean(self, chi, Om):
+        """Mean Q_L kernel - JAX interpolation with live Omega_m scaling."""
+        base = jnp.interp(chi, self.chi_QL_grid, self.QL_mean_grid)
+        return base * (Om / self.cosmo_fid['Omega_m'])
 
     @partial(jit, static_argnums=(0,))
     def QE(self, Om, chi, chi_star):
         """Q_E kernel for cosmic shear - JAX implementation."""
-        z = self.z_of_chi(chi)
+        z = self.z_of_chi(Om, chi)
         K = jnp.where(chi < chi_star, (chi_star - chi) / chi, 0.0)
         prefactor = -(3.0 / 2.0) * Om * (self.cosmo_fid['H0'] ** 2) / (self.c_km_s ** 2)
         return prefactor * (1 + z) * K
@@ -329,10 +346,10 @@ class TheoryJAX:
     def compute_Cl_LL_jax(self, Om, s8, ell, chi_min=10.0, chi_max=8000.0, nchi=100):
         """Compute C_ell^LL using JAX - fully differentiable."""
         chi_grid = jnp.linspace(chi_min, chi_max, nchi)
-        z_grid = self.z_of_chi(chi_grid)
+        z_grid = self.z_of_chi(Om, chi_grid)
         k_grid = (ell + 0.5) / chi_grid
 
-        QL = self.QL_mean(chi_grid)
+        QL = self.QL_mean(chi_grid, Om)
         Pk = vmap(lambda z, k: self.Pk_interp(Om, s8, z, k))(z_grid, k_grid)
 
         integrand = QL * QL * Pk
@@ -343,14 +360,14 @@ class TheoryJAX:
     @partial(jit, static_argnums=(0,))
     def compute_Cl_LE_jax(self, Om, s8, ell, z_gal, chi_min=10.0, chi_max=None, nchi=100):
         """Compute C_ell^LE using JAX."""
-        chi_gal = self.chi_of_z(z_gal)
+        chi_gal = self.chi_of_z(Om, z_gal)
         chi_max_actual = jnp.minimum(8000.0, chi_gal * 1.2) if chi_max is None else chi_max
 
         chi_grid = jnp.linspace(chi_min, chi_max_actual, nchi)
-        z_grid = self.z_of_chi(chi_grid)
+        z_grid = self.z_of_chi(Om, chi_grid)
         k_grid = (ell + 0.5) / chi_grid
 
-        QL = self.QL_mean(chi_grid)
+        QL = self.QL_mean(chi_grid, Om)
         QE = self.QE(Om, chi_grid, chi_gal)
         Pk = vmap(lambda z, k: self.Pk_interp(Om, s8, z, k))(z_grid, k_grid)
 
@@ -362,11 +379,11 @@ class TheoryJAX:
     @partial(jit, static_argnums=(0,))
     def compute_Cl_LP_jax(self, Om, s8, ell, z_gal):
         """Compute C_ell^LP using JAX - delta function means direct evaluation."""
-        chi_gal = self.chi_of_z(z_gal)
+        chi_gal = self.chi_of_z(Om, z_gal)
         k_at_gal = (ell + 0.5) / chi_gal
 
         QP_coeff = self.galaxy_bias / chi_gal
-        QL_at_gal = self.QL_mean(chi_gal)
+        QL_at_gal = self.QL_mean(chi_gal, Om)
         Pk_at_gal = self.Pk_interp(Om, s8, z_gal, k_at_gal)
 
         Cl = QL_at_gal * QP_coeff * Pk_at_gal
@@ -469,12 +486,14 @@ class TheoryJAX:
         if theta_min_arcmin is None:
             self.theta_min_rad = None
             self.theta_masks = {}
+            self.theta_cut_report = {}
             return
 
         theta_min_rad = theta_min_arcmin * np.pi / 180.0 / 60.0
         self.theta_min_rad = theta_min_rad
 
         self.theta_masks = {}
+        self.theta_cut_report = {}
 
         def _filter(arr, key):
             arr_np = np.array(arr)
@@ -483,6 +502,7 @@ class TheoryJAX:
             if filtered.size == 0:
                 raise ValueError(f"All theta values were cut (theta_min={theta_min_arcmin} arcmin)")
             self.theta_masks[key] = mask
+            self.theta_cut_report[key] = {'before': len(arr_np), 'after': len(filtered)}
             return jnp.array(filtered)
 
         self.theta_LL_plus = _filter(self.theta_LL_plus, 'LL_plus')
