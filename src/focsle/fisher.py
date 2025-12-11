@@ -146,6 +146,11 @@ class FisherForecast:
             print("Loading angular bins...")
         self.theory.load_angular_bins(str(self.data_dir))
         self.theory.apply_theta_min_cut(theta_min_arcmin)
+        if theta_min_arcmin is not None and self.verbose:
+            print(f"Applying theta_min = {theta_min_arcmin} arcmin")
+            for key, rep in self.theory.theta_cut_report.items():
+                if rep['before'] != rep['after']:
+                    print(f"  {key}: {rep['before']} -> {rep['after']} angles")
 
         # Load covariance matrices
         if self.verbose:

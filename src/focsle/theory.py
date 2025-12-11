@@ -313,9 +313,10 @@ class TheoryJAX:
             print(f"  Mean Q_L ready on GPU ({nchi} points)")
 
     @partial(jit, static_argnums=(0,))
-    def QL_mean(self, chi):
-        """Mean Q_L kernel - JAX interpolation."""
-        return jnp.interp(chi, self.chi_QL_grid, self.QL_mean_grid)
+    def QL_mean(self, chi, Om):
+        """Mean Q_L kernel - JAX interpolation with live Omega_m scaling."""
+        base = jnp.interp(chi, self.chi_QL_grid, self.QL_mean_grid)
+        return base * (Om / self.cosmo_fid['Omega_m'])
 
     @partial(jit, static_argnums=(0,))
     def QE(self, Om, chi, chi_star):
@@ -332,7 +333,7 @@ class TheoryJAX:
         z_grid = self.z_of_chi(chi_grid)
         k_grid = (ell + 0.5) / chi_grid
 
-        QL = self.QL_mean(chi_grid)
+        QL = self.QL_mean(chi_grid, Om)
         Pk = vmap(lambda z, k: self.Pk_interp(Om, s8, z, k))(z_grid, k_grid)
 
         integrand = QL * QL * Pk
@@ -350,7 +351,7 @@ class TheoryJAX:
         z_grid = self.z_of_chi(chi_grid)
         k_grid = (ell + 0.5) / chi_grid
 
-        QL = self.QL_mean(chi_grid)
+        QL = self.QL_mean(chi_grid, Om)
         QE = self.QE(Om, chi_grid, chi_gal)
         Pk = vmap(lambda z, k: self.Pk_interp(Om, s8, z, k))(z_grid, k_grid)
 
@@ -366,7 +367,7 @@ class TheoryJAX:
         k_at_gal = (ell + 0.5) / chi_gal
 
         QP_coeff = self.galaxy_bias / chi_gal
-        QL_at_gal = self.QL_mean(chi_gal)
+        QL_at_gal = self.QL_mean(chi_gal, Om)
         Pk_at_gal = self.Pk_interp(Om, s8, z_gal, k_at_gal)
 
         Cl = QL_at_gal * QP_coeff * Pk_at_gal
@@ -469,12 +470,14 @@ class TheoryJAX:
         if theta_min_arcmin is None:
             self.theta_min_rad = None
             self.theta_masks = {}
+            self.theta_cut_report = {}
             return
 
         theta_min_rad = theta_min_arcmin * np.pi / 180.0 / 60.0
         self.theta_min_rad = theta_min_rad
 
         self.theta_masks = {}
+        self.theta_cut_report = {}
 
         def _filter(arr, key):
             arr_np = np.array(arr)
@@ -483,6 +486,7 @@ class TheoryJAX:
             if filtered.size == 0:
                 raise ValueError(f"All theta values were cut (theta_min={theta_min_arcmin} arcmin)")
             self.theta_masks[key] = mask
+            self.theta_cut_report[key] = {'before': len(arr_np), 'after': len(filtered)}
             return jnp.array(filtered)
 
         self.theta_LL_plus = _filter(self.theta_LL_plus, 'LL_plus')
