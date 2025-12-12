@@ -156,10 +156,10 @@ class TheoryJAX:
                 sigma8_grid[i, j] = s8_camb
 
                 # Get P(k) for all z
+                PK_interp = results.get_matter_power_interpolator(
+                    nonlinear=True, hubble_units=False, k_hunit=False
+                )
                 for iz, z in enumerate(z_grid):
-                    PK_interp = results.get_matter_power_interpolator(
-                        nonlinear=True, hubble_units=False, k_hunit=False
-                    )
                     Pk_grid[i, j, iz, :] = PK_interp.P(z, k_grid)
 
                 if verbose:
@@ -431,27 +431,69 @@ class TheoryJAX:
 
     @partial(jit, static_argnums=(0,))
     def hankel_j0(self, Cl_func_values, ell_grid, theta):
-        """Hankel transform with J0 Bessel function."""
-        x_grid = ell_grid * theta
-        J0_vals = vmap(self.bessel_j0)(x_grid)
-        integrand = ell_grid * Cl_func_values * J0_vals / (2 * jnp.pi)
-        return jnp.trapezoid(integrand, ell_grid)
+        """Hankel transform with J0 Bessel function.
+
+        Args:
+            Cl_func_values: C_ell values, shape (n_ell,)
+            ell_grid: ell values, shape (n_ell,)
+            theta: scalar theta or array, shape (n_theta,)
+
+        Returns:
+            xi(theta) as a scalar (if theta is scalar) or array (n_theta,).
+        """
+        theta = jnp.asarray(theta)
+        scalar_theta = theta.ndim == 0
+        theta_vec = theta[None] if scalar_theta else theta
+
+        x_grid = ell_grid[:, None] * theta_vec[None, :]
+        J0_vals = self.bessel_j0(x_grid)
+        integrand = (ell_grid * Cl_func_values)[:, None] * J0_vals / (2 * jnp.pi)
+        xi = jnp.trapezoid(integrand.T, ell_grid)
+        return xi[0] if scalar_theta else xi
 
     @partial(jit, static_argnums=(0,))
     def hankel_j2(self, Cl_func_values, ell_grid, theta):
-        """Hankel transform with J2 Bessel function."""
-        x_grid = ell_grid * theta
-        J2_vals = vmap(self.bessel_j2)(x_grid)
-        integrand = ell_grid * Cl_func_values * J2_vals / (2 * jnp.pi)
-        return jnp.trapezoid(integrand, ell_grid)
+        """Hankel transform with J2 Bessel function.
+
+        Args:
+            Cl_func_values: C_ell values, shape (n_ell,)
+            ell_grid: ell values, shape (n_ell,)
+            theta: scalar theta or array, shape (n_theta,)
+
+        Returns:
+            xi(theta) as a scalar (if theta is scalar) or array (n_theta,).
+        """
+        theta = jnp.asarray(theta)
+        scalar_theta = theta.ndim == 0
+        theta_vec = theta[None] if scalar_theta else theta
+
+        x_grid = ell_grid[:, None] * theta_vec[None, :]
+        J2_vals = self.bessel_j2(x_grid)
+        integrand = (ell_grid * Cl_func_values)[:, None] * J2_vals / (2 * jnp.pi)
+        xi = jnp.trapezoid(integrand.T, ell_grid)
+        return xi[0] if scalar_theta else xi
 
     @partial(jit, static_argnums=(0,))
     def hankel_j4(self, Cl_func_values, ell_grid, theta):
-        """Hankel transform with J4 Bessel function."""
-        x_grid = ell_grid * theta
-        J4_vals = vmap(self.bessel_j4)(x_grid)
-        integrand = ell_grid * Cl_func_values * J4_vals / (2 * jnp.pi)
-        return jnp.trapezoid(integrand, ell_grid)
+        """Hankel transform with J4 Bessel function.
+
+        Args:
+            Cl_func_values: C_ell values, shape (n_ell,)
+            ell_grid: ell values, shape (n_ell,)
+            theta: scalar theta or array, shape (n_theta,)
+
+        Returns:
+            xi(theta) as a scalar (if theta is scalar) or array (n_theta,).
+        """
+        theta = jnp.asarray(theta)
+        scalar_theta = theta.ndim == 0
+        theta_vec = theta[None] if scalar_theta else theta
+
+        x_grid = ell_grid[:, None] * theta_vec[None, :]
+        J4_vals = self.bessel_j4(x_grid)
+        integrand = (ell_grid * Cl_func_values)[:, None] * J4_vals / (2 * jnp.pi)
+        xi = jnp.trapezoid(integrand.T, ell_grid)
+        return xi[0] if scalar_theta else xi
 
     def load_angular_bins(self, data_dir: str):
         """
@@ -528,45 +570,38 @@ class TheoryJAX:
         if ell_grid is None:
             ell_grid = jnp.logspace(0, 3.5, 80)
 
-        predictions = []
+        predictions_parts = []
 
         # LL predictions
         Cl_LL_vals = vmap(lambda ell: self.compute_Cl_LL_jax(Om, s8, ell))(ell_grid)
 
-        for theta_val in self.theta_LL_plus:
-            xi_LL_plus = self.hankel_j0(Cl_LL_vals, ell_grid, theta_val)
-            predictions.append(xi_LL_plus)
-        for theta_val in self.theta_LL_minus:
-            xi_LL_minus = self.hankel_j4(Cl_LL_vals, ell_grid, theta_val)
-            predictions.append(xi_LL_minus)
+        xi_LL_plus = self.hankel_j0(Cl_LL_vals, ell_grid, self.theta_LL_plus)
+        xi_LL_minus = self.hankel_j4(Cl_LL_vals, ell_grid, self.theta_LL_minus)
+        predictions_parts.append(xi_LL_plus)
+        predictions_parts.append(xi_LL_minus)
 
         # LE predictions
+        z_edges = self.E_dist.limits
         for bin_idx in range(self.n_tomo_bins):
-            z_edges = self.E_dist.limits
             z_gal = (z_edges[bin_idx] + z_edges[bin_idx + 1]) / 2.0
 
             Cl_LE_vals = vmap(lambda ell: self.compute_Cl_LE_jax(Om, s8, ell, z_gal))(ell_grid)
 
-            for theta_val in self.theta_LE_plus[bin_idx]:
-                xi_LE_plus = self.hankel_j0(Cl_LE_vals, ell_grid, theta_val)
-                predictions.append(xi_LE_plus)
-
-            for theta_val in self.theta_LE_minus[bin_idx]:
-                xi_LE_minus = self.hankel_j4(Cl_LE_vals, ell_grid, theta_val)
-                predictions.append(xi_LE_minus)
+            xi_LE_plus = self.hankel_j0(Cl_LE_vals, ell_grid, self.theta_LE_plus[bin_idx])
+            xi_LE_minus = self.hankel_j4(Cl_LE_vals, ell_grid, self.theta_LE_minus[bin_idx])
+            predictions_parts.append(xi_LE_plus)
+            predictions_parts.append(xi_LE_minus)
 
         # LP predictions
         for bin_idx in range(self.n_tomo_bins):
-            z_edges = self.E_dist.limits
             z_gal = (z_edges[bin_idx] + z_edges[bin_idx + 1]) / 2.0
 
             Cl_LP_vals = vmap(lambda ell: self.compute_Cl_LP_jax(Om, s8, ell, z_gal))(ell_grid)
 
-            for theta_val in self.theta_LP[bin_idx]:
-                xi_LP = self.hankel_j2(Cl_LP_vals, ell_grid, theta_val)
-                predictions.append(xi_LP)
+            xi_LP = self.hankel_j2(Cl_LP_vals, ell_grid, self.theta_LP[bin_idx])
+            predictions_parts.append(xi_LP)
 
-        return jnp.array(predictions)
+        return jnp.concatenate(predictions_parts)
 
     def predict_data_vector_batched(self, Om_batch, s8_batch, ell_grid=None):
         """
