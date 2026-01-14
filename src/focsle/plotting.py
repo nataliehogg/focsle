@@ -47,7 +47,7 @@ def plot_fisher_ellipse(
         return False
 
     # Eigenvalues and eigenvectors
-    eigenvalues, eigenvectors = np.linalg.eig(C)
+    eigenvalues, eigenvectors = np.linalg.eigh(C)
 
     # Ensure positive eigenvalues (numerical precision issues)
     if np.any(eigenvalues < 0):
