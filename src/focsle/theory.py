@@ -49,7 +49,6 @@ class TheoryJAX:
     def __init__(self, lens_file: Optional[str] = None,
                  cosmo_fid: Optional[Dict] = None):
         self.c_km_s = 299792.458  # km/s
-        self.galaxy_bias = 1.5
 
         # Fiducial cosmology (can be overridden)
         if cosmo_fid is None:
@@ -335,6 +334,11 @@ class TheoryJAX:
         return base * (Om / self.cosmo_fid['Omega_m'])
 
     @partial(jit, static_argnums=(0,))
+    def galaxy_bias(self, z):
+        """Redshift-dependent galaxy bias from Euclid recipe."""
+        return 1.1 * z ** 2.4 / (1 + z) + 0.9
+
+    @partial(jit, static_argnums=(0,))
     def QE(self, Om, chi, chi_star):
         """Q_E kernel for cosmic shear - JAX implementation."""
         z = self.z_of_chi(Om, chi)
@@ -382,7 +386,7 @@ class TheoryJAX:
         chi_gal = self.chi_of_z(Om, z_gal)
         k_at_gal = (ell + 0.5) / chi_gal
 
-        QP_coeff = self.galaxy_bias / chi_gal
+        QP_coeff = self.galaxy_bias(z_gal) / chi_gal
         QL_at_gal = self.QL_mean(chi_gal, Om)
         Pk_at_gal = self.Pk_interp(Om, s8, z_gal, k_at_gal)
 
