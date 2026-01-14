@@ -238,7 +238,7 @@ class FisherForecast:
         # Extract sizes
         n_LL = self.sizes['n_LL']
         n_LE = self.sizes['n_LE']
-        n_LP = self.sizes['n_LP']
+        # n_LP = self.sizes['n_LP'] # not needed
 
         # Compute Fisher for each probe
         if self.verbose:
