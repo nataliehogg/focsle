@@ -174,6 +174,7 @@ class FisherForecast:
         if self.verbose:
             print("Inverting covariance matrix...")
         try:
+            # self.C_full = regularize_covariance(self.C_full) # hacky way to force positive-definiteness in the F-matrix
             self.C_inv = np.linalg.inv(self.C_full)
             if self.verbose:
                 print("  Success!")
@@ -439,3 +440,9 @@ class FisherForecast:
             raise ValueError(f"No Fisher matrix computed for probe: {probe}")
 
         return np.sqrt(np.linalg.det(F))
+
+    def regularise_covariance(C, min_eigenvalue=1e-10):
+        """Clip small/negative eigenvalues to ensure positive definiteness."""
+        eigenvalues, eigenvectors = np.linalg.eigh(C)
+        eigenvalues_clipped = np.maximum(eigenvalues, min_eigenvalue)
+        return eigenvectors @ np.diag(eigenvalues_clipped) @ eigenvectors.T
