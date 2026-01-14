@@ -11,6 +11,9 @@ from matplotlib.patches import Ellipse
 from typing import Dict, List, Optional, Tuple, Union
 from pathlib import Path
 
+from matplotlib import rc
+rc('text', usetex=True)
+rc('font', family='serif')
 
 def plot_fisher_ellipse(
     F: np.ndarray,
@@ -153,7 +156,7 @@ def plot_constraints(
         ax.plot(fiducial[0], fiducial[1], 'k+', markersize=10, markeredgewidth=2)
 
         # Labels
-        ax.set_xlabel(r'$\Omega_m$', fontsize=14)
+        ax.set_xlabel(r'$\Omega_{\rm m}$', fontsize=14)
         ax.set_ylabel(r'$\sigma_8$', fontsize=14)
         ax.set_title(f'{probe}: {probe_titles.get(probe, probe)}', fontsize=13)
         ax.legend(loc='best', fontsize=11)
@@ -240,7 +243,7 @@ def plot_comparison(
         # Mark fiducial
         ax.plot(fiducial[0], fiducial[1], 'k+', markersize=10, markeredgewidth=2)
 
-        ax.set_xlabel(r'$\Omega_m$', fontsize=14)
+        ax.set_xlabel(r'$\Omega_{\rm m}$', fontsize=14)
         if ax == axes[0]:
             ax.set_ylabel(r'$\sigma_8$', fontsize=14)
         ax.set_title(f'{probe}: {probe_titles.get(probe, probe)}', fontsize=13)
