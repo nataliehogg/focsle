@@ -46,6 +46,7 @@ from .data_loader import (
 from .plotting import (
     plot_fisher_ellipse,
     plot_constraints,
+    plot_constraints_overlay,
     plot_comparison,
     print_constraints_table,
     plot_fom_comparison,
@@ -74,6 +75,7 @@ __all__ = [
     # Plotting
     'plot_fisher_ellipse',
     'plot_constraints',
+    'plot_constraints_overlay',
     'plot_comparison',
     'print_constraints_table',
     'plot_fom_comparison',

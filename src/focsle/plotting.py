@@ -177,6 +177,82 @@ def plot_constraints(
     return fig
 
 
+def plot_constraints_overlay(
+    results: Dict,
+    probes: List[str] = None,
+    figsize: Tuple[float, float] = None,
+    colors: Dict[str, str] = None,
+    output_file: Optional[str] = None,
+    title: Optional[str] = None,
+    show_2sigma: bool = True,
+    ax: Optional[plt.Axes] = None,
+) -> plt.Figure:
+    """
+    Plot multiple probe constraints on a single axis.
+
+    Args:
+        results: Dictionary containing Fisher matrices and fiducial values
+        probes: List of probes to plot (default: ['LL', 'LE', 'LP'])
+        figsize: Figure size (width, height) if creating a new figure
+        colors: Dictionary mapping probe names to colors
+        output_file: If provided, save figure to this path
+        title: Optional axis title
+        show_2sigma: Whether to show 2-sigma contour for each probe
+        ax: Optional Matplotlib axes to plot on
+
+    Returns:
+        Matplotlib figure
+    """
+    if probes is None:
+        probes = ['LL', 'LE', 'LP']
+
+    probes = [p for p in probes if p in results.get('fisher_matrices', {})]
+    if not probes:
+        raise ValueError("No valid probes found in results")
+
+    if colors is None:
+        colors = {
+            'LL': 'steelblue',
+            'LE': 'forestgreen',
+            'LP': 'coral',
+            'Combined': 'purple',
+        }
+
+    if ax is None:
+        if figsize is None:
+            figsize = (6, 5)
+        fig, ax = plt.subplots(figsize=figsize)
+    else:
+        fig = ax.figure
+
+    fiducial = results['fiducial']
+
+    for probe in probes:
+        F = results['fisher_matrices'][probe]
+        color = colors.get(probe, 'steelblue')
+        plot_fisher_ellipse(
+            F, fiducial, ax,
+            color=color,
+            label=probe,
+            show_2sigma=show_2sigma,
+        )
+
+    ax.plot(fiducial[0], fiducial[1], 'k+', markersize=10, markeredgewidth=2)
+    ax.set_xlabel(r'$\Omega_{\rm m}$', fontsize=14)
+    ax.set_ylabel(r'$\sigma_8$', fontsize=14)
+    if title:
+        ax.set_title(title, fontsize=13)
+    ax.legend(loc='best', fontsize=11)
+    ax.grid(False)
+    ax.autoscale()
+
+    if output_file:
+        plt.savefig(output_file, dpi=150, bbox_inches='tight')
+        print(f"Saved plot to {output_file}")
+
+    return fig
+
+
 def plot_comparison(
     results_list: List[Dict],
     labels: List[str],
