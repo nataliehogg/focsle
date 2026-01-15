@@ -11,6 +11,10 @@ from pathlib import Path
 from datetime import datetime
 from typing import Optional, Dict, List, Tuple, Union
 
+# Enable float64 precision in JAX (must be set before importing jax.numpy)
+import jax
+jax.config.update("jax_enable_x64", True)
+
 import jax.numpy as jnp
 from jax import jacfwd
 
@@ -22,6 +26,7 @@ from .data_loader import (
     list_available_datasets,
     parse_dataset_name,
 )
+
 
 
 class FisherForecast:
@@ -174,8 +179,19 @@ class FisherForecast:
         if self.verbose:
             print("Inverting covariance matrix...")
         try:
-            # self.C_full = regularize_covariance(self.C_full) # hacky way to force positive-definiteness in the F-matrix
-            self.C_inv = np.linalg.inv(self.C_full)
+            # Check condition number to warn about ill-conditioning
+            cond_number = np.linalg.cond(self.C_full)
+            if self.verbose:
+                print(f"  Condition number: {cond_number:.2e}")
+            if cond_number > 1e12:
+                import warnings
+                warnings.warn(
+                    f"Covariance matrix is ill-conditioned (cond={cond_number:.2e}). "
+                    "Results may have reduced numerical precision.",
+                    RuntimeWarning
+                )
+
+            self.C_inv = self._robust_symmetric_inverse(self.C_full, verbose=self.verbose)
             if self.verbose:
                 print("  Success!")
         except np.linalg.LinAlgError:
@@ -250,7 +266,7 @@ class FisherForecast:
         if self.verbose:
             print("\n1. LL only:")
         J_LL = self.jacobian[:n_LL, :]
-        C_LL_inv = jnp.array(np.linalg.inv(self.C_full[:n_LL, :n_LL]))
+        C_LL_inv = jnp.array(self._robust_symmetric_inverse(self.C_full[:n_LL, :n_LL]))
         F_LL = J_LL.T @ C_LL_inv @ J_LL
         self.fisher_matrices['LL'] = np.array(F_LL)
         self.constraints['LL'] = self._analyze_constraints(
@@ -262,7 +278,7 @@ class FisherForecast:
         if self.verbose:
             print("\n2. LE only:")
         J_LE = self.jacobian[n_LL:n_LL + n_LE, :]
-        C_LE_inv = jnp.array(np.linalg.inv(
+        C_LE_inv = jnp.array(self._robust_symmetric_inverse(
             self.C_full[n_LL:n_LL + n_LE, n_LL:n_LL + n_LE]
         ))
         F_LE = J_LE.T @ C_LE_inv @ J_LE
@@ -276,7 +292,7 @@ class FisherForecast:
         if self.verbose:
             print("\n3. LP only:")
         J_LP = self.jacobian[n_LL + n_LE:, :]
-        C_LP_inv = jnp.array(np.linalg.inv(
+        C_LP_inv = jnp.array(self._robust_symmetric_inverse(
             self.C_full[n_LL + n_LE:, n_LL + n_LE:]
         ))
         F_LP = J_LP.T @ C_LP_inv @ J_LP
@@ -307,6 +323,45 @@ class FisherForecast:
             'fiducial': fiducial,
             'param_names': param_names,
         }
+
+    def _robust_symmetric_inverse(self, M: np.ndarray, verbose: bool = False) -> np.ndarray:
+        """
+        Compute a robust inverse of a symmetric matrix.
+
+        For ill-conditioned matrices, the standard inverse can produce
+        asymmetric results or matrices that are not positive definite.
+        This method:
+        1. Computes the inverse
+        2. Symmetrizes to remove asymmetric numerical errors
+        3. Ensures positive definiteness via eigenvalue clipping
+
+        Args:
+            M: Symmetric matrix to invert
+            verbose: Print diagnostic information
+
+        Returns:
+            Robust symmetric positive-definite inverse
+        """
+        # Compute raw inverse and symmetrize
+        M_inv_raw = np.linalg.inv(M)
+        M_inv_sym = (M_inv_raw + M_inv_raw.T) / 2
+
+        # Check if result is positive definite
+        eigenvalues, eigenvectors = np.linalg.eigh(M_inv_sym)
+
+        if np.any(eigenvalues <= 0):
+            # Clip negative/zero eigenvalues to small positive value
+            min_positive = np.max(eigenvalues) * 1e-10
+            n_clipped = np.sum(eigenvalues <= 0)
+            eigenvalues_clipped = np.maximum(eigenvalues, min_positive)
+
+            if verbose:
+                print(f"  Clipped {n_clipped} non-positive eigenvalues for numerical stability")
+
+            # Reconstruct positive definite matrix
+            M_inv_sym = eigenvectors @ np.diag(eigenvalues_clipped) @ eigenvectors.T
+
+        return M_inv_sym
 
     def _apply_theta_scale_cut(self):
         """Apply theta_min cut to covariance blocks to match theory predictions."""
