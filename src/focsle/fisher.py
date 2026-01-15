@@ -467,18 +467,89 @@ class FisherForecast:
             print(f"\nResults saved to {output_path}")
 
     @staticmethod
-    def load_results(results_file: str) -> Dict:
+    def load_results(results_file: str, results_dir: str = None) -> Dict:
         """
         Load results from a pickle file.
 
+        Searches for the file in multiple locations:
+        1. The exact path provided
+        2. In results_dir (if provided)
+        3. In standard locations: ./results, ../results, package_dir/../../results
+
         Args:
-            results_file: Path to results file
+            results_file: Path to results file, or just the filename
+            results_dir: Optional directory to search in
 
         Returns:
             Dictionary containing Fisher results
         """
-        with open(results_file, 'rb') as f:
-            return pickle.load(f)
+        results_path = Path(results_file)
+
+        # If it's already a valid file, use it directly
+        if results_path.is_file():
+            with open(results_path, 'rb') as f:
+                return pickle.load(f)
+
+        # Build list of directories to search
+        search_dirs = []
+        if results_dir:
+            search_dirs.append(Path(results_dir))
+
+        # Add standard locations
+        search_dirs.extend([
+            Path.cwd() / 'results',
+            Path.cwd().parent / 'results',
+            Path(__file__).parent.parent.parent / 'results',  # package_root/results
+        ])
+
+        # Search for the file
+        filename = results_path.name
+        for search_dir in search_dirs:
+            candidate = search_dir / filename
+            if candidate.is_file():
+                with open(candidate, 'rb') as f:
+                    return pickle.load(f)
+
+        # If not found, raise helpful error
+        searched = [str(d) for d in search_dirs if d.exists()]
+        raise FileNotFoundError(
+            f"Could not find '{filename}' in any of these locations:\n"
+            + "\n".join(f"  - {d}" for d in searched)
+            + f"\n\nAvailable files in results directories:\n"
+            + "\n".join(f"  - {f.name}" for d in search_dirs if d.exists()
+                       for f in d.glob("fisher_results_*.pkl"))
+        )
+
+    @staticmethod
+    def list_saved_results(results_dir: str = None) -> List[str]:
+        """
+        List available saved Fisher results.
+
+        Args:
+            results_dir: Optional directory to search in
+
+        Returns:
+            List of available result filenames
+        """
+        search_dirs = []
+        if results_dir:
+            search_dirs.append(Path(results_dir))
+
+        search_dirs.extend([
+            Path.cwd() / 'results',
+            Path.cwd().parent / 'results',
+            Path(__file__).parent.parent.parent / 'results',
+        ])
+
+        results = []
+        seen = set()
+        for search_dir in search_dirs:
+            if search_dir.exists():
+                for f in sorted(search_dir.glob("fisher_results_*.pkl")):
+                    if f.name not in seen:
+                        results.append(f.name)
+                        seen.add(f.name)
+        return results
 
     def get_figure_of_merit(self, probe: str = 'Combined') -> float:
         """
