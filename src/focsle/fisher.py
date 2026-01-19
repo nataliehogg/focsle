@@ -9,7 +9,7 @@ import numpy as np
 import pickle
 from pathlib import Path
 from datetime import datetime
-from typing import Optional, Dict, List, Tuple, Union
+from typing import Optional, Dict, List, Tuple
 
 # Enable float64 precision in JAX (must be set before importing jax.numpy)
 import jax

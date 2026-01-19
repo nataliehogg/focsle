@@ -8,7 +8,7 @@ and comparing results from different datasets.
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.patches import Ellipse
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple
 from pathlib import Path
 
 from matplotlib import rc
@@ -334,8 +334,8 @@ def plot_comparison(
     legend_labels = []
     seen = set()
     for ax in axes:
-        h, l = ax.get_legend_handles_labels()
-        for handle, label in zip(h, l):
+        hand, lab = ax.get_legend_handles_labels()
+        for handle, label in zip(hand, lab):
             if label not in seen:
                 seen.add(label)
                 handles.append(handle)
