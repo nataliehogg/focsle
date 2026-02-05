@@ -331,9 +331,10 @@ class FisherForecast:
         For ill-conditioned matrices, the standard inverse can produce
         asymmetric results or matrices that are not positive definite.
         This method:
-        1. Computes the inverse
-        2. Symmetrizes to remove asymmetric numerical errors
-        3. Ensures positive definiteness via eigenvalue clipping
+        1. Ensures input matrix is positive definite (clips negative eigenvalues)
+        2. Computes the inverse
+        3. Symmetrizes to remove asymmetric numerical errors
+        4. Ensures output is positive definite
 
         Args:
             M: Symmetric matrix to invert
@@ -342,24 +343,42 @@ class FisherForecast:
         Returns:
             Robust symmetric positive-definite inverse
         """
-        # Compute raw inverse and symmetrize
-        M_inv_raw = np.linalg.inv(M)
-        M_inv_sym = (M_inv_raw + M_inv_raw.T) / 2
+        # First, ensure input matrix is positive definite
+        M_sym = (M + M.T) / 2  # Symmetrize input
+        eigenvalues_M, eigenvectors_M = np.linalg.eigh(M_sym)
 
-        # Check if result is positive definite
-        eigenvalues, eigenvectors = np.linalg.eigh(M_inv_sym)
-
-        if np.any(eigenvalues <= 0):
-            # Clip negative/zero eigenvalues to small positive value
-            min_positive = np.max(eigenvalues) * 1e-10
-            n_clipped = np.sum(eigenvalues <= 0)
-            eigenvalues_clipped = np.maximum(eigenvalues, min_positive)
+        if np.any(eigenvalues_M <= 0):
+            # Regularize input matrix by clipping negative eigenvalues
+            min_positive = np.max(eigenvalues_M) * 1e-10
+            n_clipped = np.sum(eigenvalues_M <= 0)
+            eigenvalues_M_clipped = np.maximum(eigenvalues_M, min_positive)
 
             if verbose:
-                print(f"  Clipped {n_clipped} non-positive eigenvalues for numerical stability")
+                print(f"  Regularized input matrix: clipped {n_clipped} non-positive eigenvalues")
 
-            # Reconstruct positive definite matrix
-            M_inv_sym = eigenvectors @ np.diag(eigenvalues_clipped) @ eigenvectors.T
+            # Reconstruct positive definite input
+            M_regularized = eigenvectors_M @ np.diag(eigenvalues_M_clipped) @ eigenvectors_M.T
+        else:
+            M_regularized = M_sym
+
+        # Compute raw inverse and symmetrize
+        M_inv_raw = np.linalg.inv(M_regularized)
+        M_inv_sym = (M_inv_raw + M_inv_raw.T) / 2
+
+        # Check if inverse is positive definite
+        eigenvalues_inv, eigenvectors_inv = np.linalg.eigh(M_inv_sym)
+
+        if np.any(eigenvalues_inv <= 0):
+            # Clip negative/zero eigenvalues to small positive value
+            min_positive = np.max(eigenvalues_inv) * 1e-10
+            n_clipped = np.sum(eigenvalues_inv <= 0)
+            eigenvalues_inv_clipped = np.maximum(eigenvalues_inv, min_positive)
+
+            if verbose:
+                print(f"  Clipped {n_clipped} non-positive eigenvalues in inverse for numerical stability")
+
+            # Reconstruct positive definite inverse
+            M_inv_sym = eigenvectors_inv @ np.diag(eigenvalues_inv_clipped) @ eigenvectors_inv.T
 
         return M_inv_sym
 
@@ -566,9 +585,3 @@ class FisherForecast:
             raise ValueError(f"No Fisher matrix computed for probe: {probe}")
 
         return np.sqrt(np.linalg.det(F))
-
-    def regularise_covariance(C, min_eigenvalue=1e-10):
-        """Clip small/negative eigenvalues to ensure positive definiteness."""
-        eigenvalues, eigenvectors = np.linalg.eigh(C)
-        eigenvalues_clipped = np.maximum(eigenvalues, min_eigenvalue)
-        return eigenvectors @ np.diag(eigenvalues_clipped) @ eigenvectors.T
