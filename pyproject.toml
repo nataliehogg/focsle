@@ -19,6 +19,8 @@ dependencies = [
 dev = [
     "jupyter",
     "ipykernel",
+    "pytest>=7.0",
+    "scipy",  # Needed for test comparisons
 ]
 
 [tool.setuptools.packages.find]
