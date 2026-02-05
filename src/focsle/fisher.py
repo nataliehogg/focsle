@@ -92,6 +92,9 @@ class FisherForecast:
         self.cov_blocks = None
         self.C_full = None
         self.C_inv = None
+        self.C_LL_inv = None
+        self.C_LE_inv = None
+        self.C_LP_inv = None
         self.sizes = None
         self._is_setup = False
 
@@ -197,6 +200,27 @@ class FisherForecast:
         except np.linalg.LinAlgError:
             raise ValueError("Covariance matrix is singular - cannot invert")
 
+        # Pre-compute block inverses for Fisher matrix computation (avoids redundant inversions)
+        if self.verbose:
+            print("Pre-computing covariance block inverses...")
+        n_LL = self.sizes['n_LL']
+        n_LE = self.sizes['n_LE']
+
+        self.C_LL_inv = self._robust_symmetric_inverse(
+            self.C_full[:n_LL, :n_LL],
+            verbose=False
+        )
+        self.C_LE_inv = self._robust_symmetric_inverse(
+            self.C_full[n_LL:n_LL + n_LE, n_LL:n_LL + n_LE],
+            verbose=False
+        )
+        self.C_LP_inv = self._robust_symmetric_inverse(
+            self.C_full[n_LL + n_LE:, n_LL + n_LE:],
+            verbose=False
+        )
+        if self.verbose:
+            print("  Block inverses cached!")
+
         self._is_setup = True
         if self.verbose:
             print("\nSetup complete!")
@@ -262,11 +286,11 @@ class FisherForecast:
             print("Computing Fisher matrices for individual probes")
             print("-" * 50)
 
-        # LL only
+        # LL only (using pre-computed inverse)
         if self.verbose:
             print("\n1. LL only:")
         J_LL = self.jacobian[:n_LL, :]
-        C_LL_inv = jnp.array(self._robust_symmetric_inverse(self.C_full[:n_LL, :n_LL]))
+        C_LL_inv = jnp.array(self.C_LL_inv)
         F_LL = J_LL.T @ C_LL_inv @ J_LL
         self.fisher_matrices['LL'] = np.array(F_LL)
         self.constraints['LL'] = self._analyze_constraints(
@@ -274,13 +298,11 @@ class FisherForecast:
         )
         self._print_constraints('LL')
 
-        # LE only
+        # LE only (using pre-computed inverse)
         if self.verbose:
             print("\n2. LE only:")
         J_LE = self.jacobian[n_LL:n_LL + n_LE, :]
-        C_LE_inv = jnp.array(self._robust_symmetric_inverse(
-            self.C_full[n_LL:n_LL + n_LE, n_LL:n_LL + n_LE]
-        ))
+        C_LE_inv = jnp.array(self.C_LE_inv)
         F_LE = J_LE.T @ C_LE_inv @ J_LE
         self.fisher_matrices['LE'] = np.array(F_LE)
         self.constraints['LE'] = self._analyze_constraints(
@@ -288,13 +310,11 @@ class FisherForecast:
         )
         self._print_constraints('LE')
 
-        # LP only
+        # LP only (using pre-computed inverse)
         if self.verbose:
             print("\n3. LP only:")
         J_LP = self.jacobian[n_LL + n_LE:, :]
-        C_LP_inv = jnp.array(self._robust_symmetric_inverse(
-            self.C_full[n_LL + n_LE:, n_LL + n_LE:]
-        ))
+        C_LP_inv = jnp.array(self.C_LP_inv)
         F_LP = J_LP.T @ C_LP_inv @ J_LP
         self.fisher_matrices['LP'] = np.array(F_LP)
         self.constraints['LP'] = self._analyze_constraints(
