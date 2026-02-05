@@ -192,6 +192,18 @@ def load_covariance_block(cov_type_dir: str, nbins: int) -> np.ndarray:
         bins_list = [(i, j) for i in range(nbins) for j in range(nbins)]
     elif cov_name == 'LLLP':
         bins_list = [(0, j) for j in range(nbins)]
+    elif cov_name == 'EEEE':
+        bins_list = [(i, j) for i in range(nbins) for j in range(nbins)]
+    elif cov_name == 'PPPP':
+        bins_list = [(i, j) for i in range(nbins) for j in range(nbins)]
+    elif cov_name == 'EPEP':
+        bins_list = [(i, j) for i in range(nbins) for j in range(nbins)]
+    elif cov_name == 'EEEP':
+        bins_list = [(i, j) for i in range(nbins) for j in range(nbins)]
+    elif cov_name == 'EEPP':
+        bins_list = [(i, j) for i in range(nbins) for j in range(nbins)]
+    elif cov_name == 'EPPP':
+        bins_list = [(i, j) for i in range(nbins) for j in range(nbins)]
     else:
         raise ValueError(f"Unknown covariance type: {cov_name}")
 
@@ -291,7 +303,9 @@ def load_covariance(data_dir: str, nbins: Optional[int] = None,
             print(f"  Auto-detected {nbins} tomographic bins")
 
     cov = {}
-    cov_types = ['LLLL', 'LELE', 'LPLP', 'LLLE', 'LELP', 'LLLP']
+    cov_types = ['LLLL', 'LELE', 'LPLP', 'LLLE', 'LELP', 'LLLP',
+                 'EEEE', 'EPEP', 'PPPP',  # New auto/cross-correlations
+                 'EEEP', 'EEPP', 'EPPP']  # New cross-blocks
 
     for cov_type in cov_types:
         cov_type_dir = cov_dir / cov_type
@@ -311,7 +325,7 @@ def load_covariance(data_dir: str, nbins: Optional[int] = None,
 
 def build_full_covariance(cov_blocks: Dict[str, np.ndarray]) -> Tuple[np.ndarray, Dict[str, int]]:
     """
-    Build full covariance matrix from blocks.
+    Build full covariance matrix from blocks (now 6 probes).
 
     Args:
         cov_blocks: Dictionary of covariance blocks
@@ -319,34 +333,89 @@ def build_full_covariance(cov_blocks: Dict[str, np.ndarray]) -> Tuple[np.ndarray
     Returns:
         Tuple of (full covariance matrix, dict of data vector sizes)
     """
-    # Detect sizes from blocks
+    # Detect sizes from diagonal blocks
     n_LL = cov_blocks['LLLL'].shape[0]
     n_LE = cov_blocks['LELE'].shape[0]
     n_LP = cov_blocks['LPLP'].shape[0]
 
-    sizes = {'n_LL': n_LL, 'n_LE': n_LE, 'n_LP': n_LP}
-    n_total = n_LL + n_LE + n_LP
+    # Check if new blocks exist (for backward compatibility)
+    has_new_blocks = 'EEEE' in cov_blocks
+
+    if has_new_blocks:
+        n_EE = cov_blocks['EEEE'].shape[0]
+        n_EP = cov_blocks['EPEP'].shape[0]
+        n_PP = cov_blocks['PPPP'].shape[0]
+        sizes = {'n_LL': n_LL, 'n_LE': n_LE, 'n_LP': n_LP,
+                 'n_EE': n_EE, 'n_EP': n_EP, 'n_PP': n_PP}
+        n_total = n_LL + n_LE + n_LP + n_EE + n_EP + n_PP
+    else:
+        sizes = {'n_LL': n_LL, 'n_LE': n_LE, 'n_LP': n_LP}
+        n_total = n_LL + n_LE + n_LP
 
     C = np.zeros((n_total, n_total))
 
-    # LL block
-    C[:n_LL, :n_LL] = cov_blocks['LLLL']
+    # Define block positions
+    if has_new_blocks:
+        offsets = {
+            'LL': 0,
+            'LE': n_LL,
+            'LP': n_LL + n_LE,
+            'EE': n_LL + n_LE + n_LP,
+            'EP': n_LL + n_LE + n_LP + n_EE,
+            'PP': n_LL + n_LE + n_LP + n_EE + n_EP
+        }
+    else:
+        offsets = {
+            'LL': 0,
+            'LE': n_LL,
+            'LP': n_LL + n_LE,
+        }
 
-    # LE block
-    C[n_LL:n_LL + n_LE, n_LL:n_LL + n_LE] = cov_blocks['LELE']
+    # Fill diagonal blocks
+    C[offsets['LL']:offsets['LE'], offsets['LL']:offsets['LE']] = cov_blocks['LLLL']
+    C[offsets['LE']:offsets['LP'], offsets['LE']:offsets['LP']] = cov_blocks['LELE']
 
-    # LP block
-    C[n_LL + n_LE:, n_LL + n_LE:] = cov_blocks['LPLP']
+    if has_new_blocks:
+        C[offsets['LP']:offsets['EE'], offsets['LP']:offsets['EE']] = cov_blocks['LPLP']
+        C[offsets['EE']:offsets['EP'], offsets['EE']:offsets['EP']] = cov_blocks['EEEE']
+        C[offsets['EP']:offsets['PP'], offsets['EP']:offsets['PP']] = cov_blocks['EPEP']
+        C[offsets['PP']:, offsets['PP']:] = cov_blocks['PPPP']
+    else:
+        C[offsets['LP']:, offsets['LP']:] = cov_blocks['LPLP']
 
-    # Cross-correlation blocks
-    C[:n_LL, n_LL:n_LL + n_LE] = cov_blocks['LLLE']
-    C[n_LL:n_LL + n_LE, :n_LL] = cov_blocks['LLLE'].T
+    # Fill cross-correlation blocks (symmetric)
+    # LL-LE
+    C[offsets['LL']:offsets['LE'], offsets['LE']:offsets['LP']] = cov_blocks['LLLE']
+    C[offsets['LE']:offsets['LP'], offsets['LL']:offsets['LE']] = cov_blocks['LLLE'].T
 
-    C[n_LL:n_LL + n_LE, n_LL + n_LE:] = cov_blocks['LELP']
-    C[n_LL + n_LE:, n_LL:n_LL + n_LE] = cov_blocks['LELP'].T
+    # LE-LP
+    if has_new_blocks:
+        C[offsets['LE']:offsets['LP'], offsets['LP']:offsets['EE']] = cov_blocks['LELP']
+        C[offsets['LP']:offsets['EE'], offsets['LE']:offsets['LP']] = cov_blocks['LELP'].T
+    else:
+        C[offsets['LE']:offsets['LP'], offsets['LP']:] = cov_blocks['LELP']
+        C[offsets['LP']:, offsets['LE']:offsets['LP']] = cov_blocks['LELP'].T
 
-    C[:n_LL, n_LL + n_LE:] = cov_blocks['LLLP']
-    C[n_LL + n_LE:, :n_LL] = cov_blocks['LLLP'].T
+    # LL-LP
+    if has_new_blocks:
+        C[offsets['LL']:offsets['LE'], offsets['LP']:offsets['EE']] = cov_blocks['LLLP']
+        C[offsets['LP']:offsets['EE'], offsets['LL']:offsets['LE']] = cov_blocks['LLLP'].T
+    else:
+        C[offsets['LL']:offsets['LE'], offsets['LP']:] = cov_blocks['LLLP']
+        C[offsets['LP']:, offsets['LL']:offsets['LE']] = cov_blocks['LLLP'].T
+
+    if has_new_blocks:
+        # EE-EP
+        C[offsets['EE']:offsets['EP'], offsets['EP']:offsets['PP']] = cov_blocks['EEEP']
+        C[offsets['EP']:offsets['PP'], offsets['EE']:offsets['EP']] = cov_blocks['EEEP'].T
+
+        # EE-PP
+        C[offsets['EE']:offsets['EP'], offsets['PP']:] = cov_blocks['EEPP']
+        C[offsets['PP']:, offsets['EE']:offsets['EP']] = cov_blocks['EEPP'].T
+
+        # EP-PP
+        C[offsets['EP']:offsets['PP'], offsets['PP']:] = cov_blocks['EPPP']
+        C[offsets['PP']:, offsets['EP']:offsets['PP']] = cov_blocks['EPPP'].T
 
     return C, sizes
 

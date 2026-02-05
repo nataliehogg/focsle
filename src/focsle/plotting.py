@@ -448,3 +448,75 @@ def plot_fom_comparison(
         print(f"Saved FoM comparison to {output_file}")
 
     return fig
+
+
+def plot_all_combinations(
+    forecast: 'FisherForecast',
+    probe_sets: List[List[str]] = None,
+    figsize: Tuple[float, float] = (10, 8),
+    output_file: Optional[str] = None,
+) -> plt.Figure:
+    """
+    Plot multiple probe combinations in a single figure.
+
+    This is a convenience function that uses compute_custom_fisher()
+    from a FisherForecast instance.
+
+    Args:
+        forecast: FisherForecast instance (after setup() and compute_fisher())
+        probe_sets: List of probe combinations to plot
+                    Default: [['LL'], ['EE'], ['PP'], ['LL','EE','PP']]
+        figsize: Figure size
+        output_file: Optional output file path
+
+    Returns:
+        Matplotlib figure
+    """
+    if probe_sets is None:
+        probe_sets = [
+            ['LL'],
+            ['EE'],
+            ['PP'],
+            ['LL', 'EE'],
+            ['EE', 'PP'],
+            ['LL', 'EE', 'PP'],
+        ]
+
+    colors = ['steelblue', 'forestgreen', 'coral', 'purple', 'crimson', 'orange']
+
+    fig, ax = plt.subplots(figsize=figsize)
+
+    fiducial = forecast.fiducial
+
+    for i, probe_set in enumerate(probe_sets):
+        # Compute Fisher for this combination
+        result = forecast.compute_custom_fisher(probe_set)
+        F = result['fisher_matrix']
+        label = result['probe_combination']
+
+        color = colors[i % len(colors)]
+
+        plot_fisher_ellipse(
+            F, fiducial, ax,
+            color=color,
+            label=label,
+            show_2sigma=True,
+            alpha_1sig=0.25,
+            alpha_2sig=0.1,
+        )
+
+    ax.plot(fiducial[0], fiducial[1], 'k+', markersize=12, markeredgewidth=2)
+    ax.set_xlabel(r'$\Omega_{\rm m}$', fontsize=14)
+    ax.set_ylabel(r'$\sigma_8$', fontsize=14)
+    ax.set_title('Fisher Constraints: Various Probe Combinations', fontsize=14)
+    ax.legend(loc='best', fontsize=10)
+    ax.grid(False)
+    ax.autoscale()
+
+    plt.tight_layout()
+
+    if output_file:
+        plt.savefig(output_file, dpi=150, bbox_inches='tight')
+        print(f"Saved plot to {output_file}")
+
+    return fig
