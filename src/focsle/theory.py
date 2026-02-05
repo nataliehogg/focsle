@@ -432,42 +432,33 @@ class TheoryJAX:
 
     @partial(jit, static_argnums=(0,))
     def bessel_j0(self, x):
-        """Bessel J0 - hybrid: series for small x, bessel_jn for large x."""
+        """
+        Bessel function of the first kind, order 0.
+
+        Uses JAX's native bessel_jn for all x values - accurate and differentiable.
+        """
         from jax.scipy.special import bessel_jn
-
-        def j0_series(x):
-            x2 = (x / 2.0) ** 2
-            result = 1.0 - x2 * (1.0 - x2 / 4.0 * (1.0 - x2 / 9.0 * (1.0 - x2 / 16.0)))
-            return result
-
-        return jnp.where(jnp.abs(x) < 5.0, j0_series(x), bessel_jn(x, v=0)[0])
+        return bessel_jn(x, v=0)[0]
 
     @partial(jit, static_argnums=(0,))
     def bessel_j2(self, x):
-        """Bessel J2 - hybrid: series for small x, bessel_jn for large x."""
+        """
+        Bessel function of the first kind, order 2.
+
+        Uses JAX's native bessel_jn for all x values - accurate and differentiable.
+        """
         from jax.scipy.special import bessel_jn
-
-        def j2_series(x):
-            x_half = x / 2.0
-            x2 = x_half * x_half
-            result = x2 / 2.0 * (1.0 - x2 / 6.0 * (1.0 - x2 / 10.0 * (1.0 - x2 / 14.0)))
-            return result
-
-        return jnp.where(jnp.abs(x) < 5.0, j2_series(x), bessel_jn(x, v=2)[2])
+        return bessel_jn(x, v=2)[2]
 
     @partial(jit, static_argnums=(0,))
     def bessel_j4(self, x):
-        """Bessel J4 - hybrid: series for small x, bessel_jn for large x."""
+        """
+        Bessel function of the first kind, order 4.
+
+        Uses JAX's native bessel_jn for all x values - accurate and differentiable.
+        """
         from jax.scipy.special import bessel_jn
-
-        def j4_series(x):
-            x_half = x / 2.0
-            x2 = x_half * x_half
-            x4 = x2 * x2
-            result = x4 / 384.0 * (1.0 - x2 / 10.0 * (1.0 - x2 / 14.0))
-            return result
-
-        return jnp.where(jnp.abs(x) < 5.0, j4_series(x), bessel_jn(x, v=4)[4])
+        return bessel_jn(x, v=4)[4]
 
     @partial(jit, static_argnums=(0,))
     def hankel_j0(self, Cl_func_values, ell_grid, theta):
