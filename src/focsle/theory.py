@@ -29,6 +29,39 @@ except RuntimeError:
     print(f"JAX running on: {jax.devices()}")
 
 
+# =============================================================================
+# Physical Constants and Default Grid Parameters
+# =============================================================================
+
+# Redshift grid defaults for P(k) computation
+# Maximum redshift covers typical source galaxies in strong lensing surveys
+Z_MAX_CAMB = 3.5  # Maximum redshift for CAMB P(k) grid
+Z_MIN_CAMB = 0.0  # Minimum redshift (today)
+
+# Wavenumber grid defaults for P(k) computation (in h/Mpc)
+# Range chosen to cover scales relevant for weak lensing and galaxy clustering
+K_MIN_CAMB = 1e-4  # Minimum k (h/Mpc) - large scales
+K_MAX_CAMB = 10.0  # Maximum k (h/Mpc) - small scales (10 h/Mpc ~ 0.6 Mpc)
+
+# Comoving distance grid defaults (in Mpc)
+# Range covers typical lens-source separations in strong lensing
+CHI_MIN_DEFAULT = 10.0    # Minimum comoving distance (Mpc) - nearby universe
+CHI_MAX_DEFAULT = 8000.0  # Maximum comoving distance (Mpc) - covers z~2-3
+
+# Extended range for pre-computing mean Q_L kernel
+CHI_MAX_QL_GRID = 10000.0  # Larger range for Q_L kernel grid
+
+# Default number of grid points for numerical integrations
+N_CHI_CL = 100   # Points for C_ell integrals over comoving distance
+N_CHI_QL = 200   # Points for Q_L kernel pre-computation (higher accuracy needed)
+
+# Angular multipole defaults for Hankel transforms
+# Range chosen to capture angular scales from arcmin to degrees
+ELL_MIN_DEFAULT = 1.0      # Minimum multipole (large angular scales)
+ELL_MAX_DEFAULT = 10**3.5  # Maximum multipole (~3162, corresponds to ~arcmin)
+N_ELL_DEFAULT = 80         # Number of ell points for Hankel transform
+
+
 class TheoryJAX:
     """
     JAX-accelerated theory calculator.
@@ -124,8 +157,8 @@ class TheoryJAX:
 
         Om_grid = np.linspace(*Om_range, nOm)
         As_grid = np.linspace(*As_range, nAs)
-        z_grid = np.linspace(0.0, 3.5, nz)
-        k_grid = np.logspace(-4, 1, nk)  # h/Mpc
+        z_grid = np.linspace(Z_MIN_CAMB, Z_MAX_CAMB, nz)
+        k_grid = np.logspace(np.log10(K_MIN_CAMB), np.log10(K_MAX_CAMB), nk)
 
         # Pre-allocate
         Pk_grid = np.zeros((nOm, nAs, nz, nk))
@@ -286,8 +319,9 @@ class TheoryJAX:
         # Pre-compute mean Q_L kernel on grid
         self._precompute_QL_mean(verbose=verbose)
 
-    def _precompute_QL_mean(self, chi_min: float = 10, chi_max: float = 10000,
-                            nchi: int = 200, verbose: bool = True):
+    def _precompute_QL_mean(self, chi_min: float = CHI_MIN_DEFAULT,
+                            chi_max: float = CHI_MAX_QL_GRID,
+                            nchi: int = N_CHI_QL, verbose: bool = True):
         """Pre-compute mean Q_L kernel (numpy, then transfer to JAX)."""
         chi_grid_np = np.linspace(chi_min, chi_max, nchi)
         QL_mean_np = np.zeros(nchi)
@@ -347,7 +381,8 @@ class TheoryJAX:
         return prefactor * (1 + z) * K
 
     @partial(jit, static_argnums=(0,))
-    def compute_Cl_LL_jax(self, Om, s8, ell, chi_min=10.0, chi_max=8000.0, nchi=100):
+    def compute_Cl_LL_jax(self, Om, s8, ell, chi_min=CHI_MIN_DEFAULT,
+                          chi_max=CHI_MAX_DEFAULT, nchi=N_CHI_CL):
         """Compute C_ell^LL using JAX - fully differentiable."""
         chi_grid = jnp.linspace(chi_min, chi_max, nchi)
         z_grid = self.z_of_chi(Om, chi_grid)
@@ -362,10 +397,11 @@ class TheoryJAX:
         return Cl
 
     @partial(jit, static_argnums=(0,))
-    def compute_Cl_LE_jax(self, Om, s8, ell, z_gal, chi_min=10.0, chi_max=None, nchi=100):
+    def compute_Cl_LE_jax(self, Om, s8, ell, z_gal, chi_min=CHI_MIN_DEFAULT,
+                          chi_max=None, nchi=N_CHI_CL):
         """Compute C_ell^LE using JAX."""
         chi_gal = self.chi_of_z(Om, z_gal)
-        chi_max_actual = jnp.minimum(8000.0, chi_gal * 1.2) if chi_max is None else chi_max
+        chi_max_actual = jnp.minimum(CHI_MAX_DEFAULT, chi_gal * 1.2) if chi_max is None else chi_max
 
         chi_grid = jnp.linspace(chi_min, chi_max_actual, nchi)
         z_grid = self.z_of_chi(Om, chi_grid)
@@ -572,7 +608,7 @@ class TheoryJAX:
             Flat array of predictions, shape (n_data,)
         """
         if ell_grid is None:
-            ell_grid = jnp.logspace(0, 3.5, 80)
+            ell_grid = jnp.logspace(np.log10(ELL_MIN_DEFAULT), np.log10(ELL_MAX_DEFAULT), N_ELL_DEFAULT)
 
         predictions_parts = []
 
