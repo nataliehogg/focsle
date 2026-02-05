@@ -454,21 +454,66 @@ class TheoryJAX:
         return Cl
 
     @partial(jit, static_argnums=(0,))
-    def compute_Cl_EP_jax(self, Om, s8, ell, z_gal):
+    def compute_Cl_EP_jax(self, Om, s8, ell, z_gal, chi_min=CHI_MIN_DEFAULT,
+                          chi_max=None, nchi=N_CHI_CL):
         """
         Compute C_ell^EP - cosmic shear × position cross-correlation.
 
-        Similar to LP but uses Q_E instead of Q_L.
-        Delta function for position means direct evaluation.
+        This is galaxy-galaxy lensing: shear of background sources
+        correlated with positions of foreground galaxies.
+
+        For the position (P), we have a delta function at z_gal.
+        For the shear (E), we integrate over matter between us and sources beyond z_gal.
+
+        We use an effective source distribution extending beyond z_gal.
         """
         chi_gal = self.chi_of_z(Om, z_gal)
-        k_at_gal = (ell + 0.5) / chi_gal
 
+        # For EP, we need sources beyond the lens galaxies
+        # Use sources extending from chi_gal to some higher redshift
+        # Conservative choice: integrate from chi_gal to chi_gal * 1.5 (or CHI_MAX)
+        chi_min_sources = chi_gal
+        chi_max_sources = jnp.minimum(CHI_MAX_DEFAULT, chi_gal * 1.5) if chi_max is None else chi_max
+
+        # If chi_min_sources >= chi_max_sources, there are no sources beyond
+        # In this case, return zero (no galaxy-galaxy lensing signal)
+        chi_range = chi_max_sources - chi_min_sources
+
+        # Integration over the source distribution
+        # For simplicity, assume uniform source distribution beyond z_gal
+        chi_grid = jnp.linspace(chi_min_sources, chi_max_sources, nchi)
+        z_grid = self.z_of_chi(Om, chi_grid)
+        k_grid = (ell + 0.5) / chi_grid
+
+        # Position kernel at lens redshift (delta function → direct evaluation at chi_gal)
         QP_coeff = self.galaxy_bias(z_gal) / chi_gal
-        QE_at_gal = self.QE(Om, chi_gal, chi_gal)  # Q_E evaluated at galaxy redshift
-        Pk_at_gal = self.Pk_interp(Om, s8, z_gal, k_at_gal)
 
-        Cl = QE_at_gal * QP_coeff * Pk_at_gal
+        # Shear kernel: QE(chi, chi_source) for sources at chi_source > chi_gal
+        # We evaluate at chi = chi_gal (where the lenses are)
+        # But average over source positions chi_source
+
+        # For each source position, get QE at the lens position
+        def integrand_for_source(chi_source):
+            QE_at_lens = self.QE(Om, chi_gal, chi_source)  # Shear at lens from sources at chi_source
+            k_at_source = (ell + 0.5) / chi_source
+            z_source = self.z_of_chi(Om, chi_source)
+            Pk = self.Pk_interp(Om, s8, z_source, k_at_source)
+            return QE_at_lens * Pk
+
+        # Integrate over source distribution
+        from jax import vmap
+        integrands = vmap(integrand_for_source)(chi_grid)
+        integral = jnp.trapezoid(integrands, chi_grid)
+
+        # Normalize by source distribution extent
+        # (This is a simplified uniform weighting)
+        n_source_norm = 1.0 / jnp.maximum(chi_range, 1.0)
+
+        Cl = QP_coeff * integral * n_source_norm
+
+        # Handle edge case where there's no range
+        Cl = jnp.where(chi_range > 10.0, Cl, 0.0)
+
         return Cl
 
     @partial(jit, static_argnums=(0,))
