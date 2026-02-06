@@ -106,3 +106,23 @@ def test_load_lens_catalog():
 
         np.testing.assert_array_equal(z_d, test_data[:, 0])
         np.testing.assert_array_equal(z_s, test_data[:, 1])
+
+
+def test_redshift_pickling_shim_pb():
+    """Shimmed legacy redshift distribution should expose a usable pb(z, b)."""
+    from functions.redshift_distributions import Redshift_Distributions, redshift_distribution_Euclid
+
+    dist = Redshift_Distributions()
+    dist.limits = np.array([0.0, 0.5, 1.0])
+    dist.Nbinz = 2
+    dist.starting_distribution = redshift_distribution_Euclid
+    z_norm = np.linspace(0.0, 3.0, 4096)
+    dist.norm_factor = np.trapz(redshift_distribution_Euclid(z_norm), z_norm)
+
+    pb_in = dist.pb(0.25, 0)
+    pb_out = dist.pb(0.75, 0)
+    pb_bad_bin = dist.pb(0.25, 99)
+
+    assert pb_in > 0.0
+    assert pb_out == 0.0
+    assert pb_bad_bin == 0.0

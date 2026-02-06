@@ -26,12 +26,56 @@ def _register_pickling_shims():
         def __init__(self, *args, **kwargs):
             pass
 
+        def overall_distribution(self, z):
+            z_arr = np.asarray(z, dtype=float)
+            if not hasattr(self, 'starting_distribution') or self.starting_distribution is None:
+                return np.zeros_like(z_arr)
+
+            norm = float(getattr(self, 'norm_factor', 0.0))
+            if norm <= 0.0:
+                return np.zeros_like(z_arr)
+
+            return np.asarray(self.starting_distribution(z_arr), dtype=float) / norm
+
+        def pb(self, z, b):
+            """Per-bin redshift PDF fallback for legacy pickles."""
+            if not hasattr(self, 'limits'):
+                return 0.0
+
+            limits = np.asarray(self.limits, dtype=float)
+            if b < 0 or b + 1 >= len(limits):
+                return 0.0
+
+            zzmin = float(limits[b])
+            zzmax = float(limits[b + 1])
+            z_val = float(z)
+
+            if not (zzmin <= z_val < zzmax):
+                return 0.0
+
+            # Prefer original distribution if available.
+            if hasattr(self, 'starting_distribution') and self.starting_distribution is not None:
+                z_norm = np.linspace(zzmin, zzmax, 256)
+                overall = self.overall_distribution(z_norm)
+                norm = float(np.trapz(overall, z_norm))
+                if norm > 0.0:
+                    return float(self.overall_distribution(z_val) / norm)
+
+            # Last-resort fallback: uniform inside the bin.
+            width = zzmax - zzmin
+            return float(1.0 / width) if width > 0.0 else 0.0
+
     class Angular_Distributions:
         def __init__(self, *args, **kwargs):
             pass
 
     def redshift_distribution_Euclid(z):
-        return 0.0 * z
+        z_arr = np.asarray(z, dtype=float)
+        a = 0.4710
+        b = 5.1843
+        c = 0.7259
+        A = 1.75564
+        return A * (z_arr ** a + z_arr ** (a * b)) / (z_arr ** b + c)
 
     shim_functions = types.ModuleType('functions')
     shim_rd = types.ModuleType('functions.redshift_distributions')

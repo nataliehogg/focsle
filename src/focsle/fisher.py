@@ -307,6 +307,22 @@ class FisherForecast:
         jacobian_func = jacfwd(data_vec_func)
         self.jacobian = jacobian_func(params_fid)
 
+        # Some datasets contain only a subset of probe covariances (e.g., LL/LE/LP).
+        # The theory may predict additional probes; align to covariance size.
+        n_data_cov = self.C_full.shape[0]
+        if self.jacobian.shape[0] > n_data_cov:
+            if self.verbose:
+                print(
+                    f"  Warning: theory data vector ({self.jacobian.shape[0]}) is larger than "
+                    f"covariance size ({n_data_cov}); truncating to first {n_data_cov} entries."
+                )
+            self.jacobian = self.jacobian[:n_data_cov, :]
+        elif self.jacobian.shape[0] < n_data_cov:
+            raise ValueError(
+                f"Theory data vector ({self.jacobian.shape[0]}) is shorter than covariance size "
+                f"({n_data_cov}); cannot compute Fisher matrix."
+            )
+
         if self.verbose:
             print(f"  Jacobian shape: {self.jacobian.shape}")
             print("  Done!")
@@ -582,13 +598,13 @@ class FisherForecast:
 
         # LE indices (per bin: plus then minus)
         le_mask_list = []
-        for i in range(self.theory.n_tomo_bins):
+        for i in range(len(self.theory.theta_LE_plus)):
             le_mask_list.append(masks[f'LE_plus_{i}'])
             le_mask_list.append(masks[f'LE_minus_{i}'])
         idx_LE = build_indices(le_mask_list)
 
         # LP indices (per bin)
-        lp_mask_list = [masks[f'LP_{i}'] for i in range(self.theory.n_tomo_bins)]
+        lp_mask_list = [masks[f'LP_{i}'] for i in range(len(self.theory.theta_LP))]
         idx_LP = build_indices(lp_mask_list)
 
         # Slice covariance blocks

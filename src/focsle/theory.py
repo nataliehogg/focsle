@@ -54,6 +54,7 @@ CHI_MAX_QL_GRID = 10000.0  # Larger range for Q_L kernel grid
 # Default number of grid points for numerical integrations
 N_CHI_CL = 100   # Points for C_ell integrals over comoving distance
 N_CHI_QL = 200   # Points for Q_L kernel pre-computation (higher accuracy needed)
+N_Z_KERNEL = 256  # Points for redshift-bin averaging in Q_E/Q_P precomputation
 
 # Angular multipole defaults for Hankel transforms
 # Range chosen to capture angular scales from arcmin to degrees
@@ -311,61 +312,143 @@ class TheoryJAX:
 
         self.E_dist = zdist['E']
         self.P_dist = zdist['P']
-        self.Nbinz = self.E_dist.Nbinz
+        self.Nbinz_E = int(self.E_dist.Nbinz)
+        self.Nbinz_P = int(self.P_dist.Nbinz)
+        self.Nbinz = self.Nbinz_E
+
+        if self.Nbinz_E != self.Nbinz_P:
+            warnings.warn(
+                f"E/P bin mismatch detected (E={self.Nbinz_E}, P={self.Nbinz_P}). "
+                "EP uses the overlapping bin range.",
+                RuntimeWarning,
+            )
 
         if verbose:
-            print(f"Loaded {self.Nbinz} tomographic bins")
+            print(f"Loaded {self.Nbinz_E} E bins and {self.Nbinz_P} P bins")
 
-        # Pre-compute mean Q_L kernel on grid
+        if not hasattr(self, 'chi_bg_table'):
+            raise RuntimeError("Background table missing. Call setup_Pk_grid() before setup_galaxy_distributions().")
+
+        # Pre-compute distribution tables and kernels on fixed grids.
+        self._precompute_distribution_pdfs(verbose=verbose)
         self._precompute_QL_mean(verbose=verbose)
+        self._precompute_QE_mean(verbose=verbose)
+
+    def _evaluate_bin_pdf(self, dist, bin_idx: int, z_grid: np.ndarray) -> np.ndarray:
+        """Evaluate and normalize a tomographic-bin redshift PDF on a fixed z-grid."""
+        z_min = float(dist.limits[bin_idx])
+        z_max = float(dist.limits[bin_idx + 1])
+
+        if hasattr(dist, 'pb') and callable(dist.pb):
+            pdf = np.array([float(dist.pb(float(z), bin_idx)) for z in z_grid], dtype=float)
+        else:
+            # Fallback for minimal shim objects: uniform within the bin.
+            in_bin = (z_grid >= z_min) & (z_grid <= z_max)
+            width = max(z_max - z_min, 1e-6)
+            pdf = in_bin.astype(float) / width
+
+        pdf = np.clip(pdf, 0.0, None)
+        norm = float(np.trapz(pdf, z_grid))
+
+        if not np.isfinite(norm) or norm <= 0.0:
+            # Robust fallback so setup remains usable with incomplete legacy pickles.
+            z_mid = 0.5 * (z_min + z_max)
+            sigma = max(0.25 * (z_max - z_min), 1e-3)
+            pdf = np.exp(-0.5 * ((z_grid - z_mid) / sigma) ** 2)
+            norm = float(np.trapz(pdf, z_grid))
+
+        return pdf / max(norm, 1e-12)
+
+    def _precompute_distribution_pdfs(self, nz: int = N_Z_KERNEL, verbose: bool = True):
+        """Pre-compute redshift PDFs for E/P bins on a common z-grid."""
+        z_max = max(float(self.E_dist.limits[-1]), float(self.P_dist.limits[-1]), float(self.z_bg[-1]))
+        z_grid_np = np.linspace(0.0, z_max, nz)
+
+        E_pdf_np = np.zeros((self.Nbinz_E, nz))
+        P_pdf_np = np.zeros((self.Nbinz_P, nz))
+
+        for b in range(self.Nbinz_E):
+            E_pdf_np[b, :] = self._evaluate_bin_pdf(self.E_dist, b, z_grid_np)
+        for b in range(self.Nbinz_P):
+            P_pdf_np[b, :] = self._evaluate_bin_pdf(self.P_dist, b, z_grid_np)
+
+        self.z_pdf_grid = jnp.array(z_grid_np)
+        self.E_pdf_table = jnp.array(E_pdf_np)
+        self.P_pdf_table = jnp.array(P_pdf_np)
+
+        if verbose:
+            print(f"Pre-computed E/P redshift PDFs on {nz} z-points")
 
     def _precompute_QL_mean(self, chi_min: float = CHI_MIN_DEFAULT,
                             chi_max: float = CHI_MAX_QL_GRID,
                             nchi: int = N_CHI_QL, verbose: bool = True):
-        """Pre-compute mean Q_L kernel (numpy, then transfer to JAX)."""
+        """Pre-compute mean LOS geometry kernel K_LOS(chi), averaged over lenses."""
         chi_grid_np = np.linspace(chi_min, chi_max, nchi)
-        QL_mean_np = np.zeros(nchi)
+        KL_mean_np = np.zeros(nchi)
 
         if verbose:
-            print("Pre-computing mean Q_L kernel...")
+            print("Pre-computing mean LOS kernel...")
 
-        # Convert lens arrays to numpy for this computation
         Om_fid = self.cosmo_fid['Omega_m']
         chi_d_np = np.array(self.chi_of_z(Om_fid, jnp.array(self.z_d_array)))
         chi_s_np = np.array(self.chi_of_z(Om_fid, jnp.array(self.z_s_array)))
 
         for j, chi in enumerate(chi_grid_np):
-            for i in range(self.N_lenses):
-                chi_d, chi_s = chi_d_np[i], chi_s_np[i]
-
-                if chi < chi_d:
-                    K = 0.0
-                elif chi < chi_s:
-                    K = (chi - chi_d) / chi
-                else:
-                    K = (chi_s - chi_d) / chi
-
-                z_chi = np.interp(chi, np.array(self.chi_bg_table)[0], np.array(self.z_bg))
-                prefactor = -(3.0 / 2.0) * self.cosmo_fid['Omega_m'] * \
-                           (self.cosmo_fid['H0'] ** 2) / (self.c_km_s ** 2)
-                Q_L_val = prefactor * (1 + z_chi) * K
-
-                QL_mean_np[j] += Q_L_val
-
-            QL_mean_np[j] /= self.N_lenses
+            chi_safe = max(chi, 1e-6)
+            K_vals = np.where(
+                chi < chi_d_np,
+                0.0,
+                np.where(
+                    chi < chi_s_np,
+                    (chi - chi_d_np) / chi_safe,
+                    (chi_s_np - chi_d_np) / chi_safe,
+                ),
+            )
+            KL_mean_np[j] = float(np.mean(K_vals))
 
         # Transfer to JAX/GPU
         self.chi_QL_grid = jnp.array(chi_grid_np)
-        self.QL_mean_grid = jnp.array(QL_mean_np)
+        self.KL_mean_grid = jnp.array(KL_mean_np)
 
         if verbose:
-            print(f"  Mean Q_L ready on GPU ({nchi} points)")
+            print(f"  Mean LOS kernel ready on GPU ({nchi} points)")
+
+    def _precompute_QE_mean(self, chi_min: float = CHI_MIN_DEFAULT,
+                            chi_max: float = CHI_MAX_QL_GRID,
+                            nchi: int = N_CHI_QL, verbose: bool = True):
+        """Pre-compute mean weak-lensing geometry kernel K_E(chi) for each E bin."""
+        chi_grid_np = np.linspace(chi_min, chi_max, nchi)
+        KE_mean_np = np.zeros((self.Nbinz_E, nchi))
+
+        if verbose:
+            print("Pre-computing mean E-kernels...")
+
+        Om_fid = self.cosmo_fid['Omega_m']
+        z_pdf_np = np.array(self.z_pdf_grid)
+        E_pdf_np = np.array(self.E_pdf_table)
+        chi_source_fid = np.array(self.chi_of_z(Om_fid, jnp.array(z_pdf_np)))
+        chi_source_safe = np.maximum(chi_source_fid, 1e-6)
+
+        chi_col = chi_grid_np[:, None]
+        chi_src_row = chi_source_safe[None, :]
+        K_matrix = np.where(chi_col < chi_src_row, (chi_src_row - chi_col) / chi_src_row, 0.0)
+
+        for b in range(self.Nbinz_E):
+            KE_mean_np[b, :] = np.trapz(K_matrix * E_pdf_np[b][None, :], z_pdf_np, axis=1)
+
+        self.chi_QE_grid = jnp.array(chi_grid_np)
+        self.KE_mean_grid = jnp.array(KE_mean_np)
+
+        if verbose:
+            print(f"  Mean E-kernels ready on GPU ({self.Nbinz_E} bins, {nchi} chi points)")
 
     @partial(jit, static_argnums=(0,))
     def QL_mean(self, chi, Om):
-        """Mean Q_L kernel - JAX interpolation with live Omega_m scaling."""
-        base = jnp.interp(chi, self.chi_QL_grid, self.QL_mean_grid)
-        return base * (Om / self.cosmo_fid['Omega_m'])
+        """Mean LOS lensing kernel using precomputed geometry and live cosmology."""
+        K = jnp.interp(chi, self.chi_QL_grid, self.KL_mean_grid)
+        z = self.z_of_chi(Om, chi)
+        prefactor = -(3.0 / 2.0) * Om * (self.cosmo_fid['H0'] ** 2) / (self.c_km_s ** 2)
+        return prefactor * (1 + z) * K
 
     @partial(jit, static_argnums=(0,))
     def galaxy_bias(self, z):
@@ -373,12 +456,21 @@ class TheoryJAX:
         return 1.1 * z ** 2.4 / (1 + z) + 0.9
 
     @partial(jit, static_argnums=(0,))
-    def QE(self, Om, chi, chi_star):
-        """Q_E kernel for cosmic shear - JAX implementation."""
+    def QE_mean(self, Om, chi, bin_idx):
+        """Mean Q_E kernel averaged over source redshift distribution in one E bin."""
+        K = jnp.interp(chi, self.chi_QE_grid, self.KE_mean_grid[bin_idx])
         z = self.z_of_chi(Om, chi)
-        K = jnp.where(chi < chi_star, (chi_star - chi) / chi, 0.0)
         prefactor = -(3.0 / 2.0) * Om * (self.cosmo_fid['H0'] ** 2) / (self.c_km_s ** 2)
         return prefactor * (1 + z) * K
+
+    @partial(jit, static_argnums=(0,))
+    def QP_mean(self, Om, chi, bin_idx):
+        """Mean Q_P kernel for one P tomographic bin."""
+        z = self.z_of_chi(Om, chi)
+        pz = jnp.interp(z, self.z_pdf_grid, self.P_pdf_table[bin_idx], left=0.0, right=0.0)
+        Ez = jnp.sqrt(jnp.maximum(Om * (1 + z) ** 3 + (1.0 - Om), 1e-12))
+        H_over_c = (self.cosmo_fid['H0'] / self.c_km_s) * Ez
+        return H_over_c * pz * self.galaxy_bias(z) / jnp.maximum(chi, 1e-6)
 
     @partial(jit, static_argnums=(0,))
     def compute_Cl_LL_jax(self, Om, s8, ell, chi_min=CHI_MIN_DEFAULT,
@@ -397,18 +489,15 @@ class TheoryJAX:
         return Cl
 
     @partial(jit, static_argnums=(0,))
-    def compute_Cl_LE_jax(self, Om, s8, ell, z_gal, chi_min=CHI_MIN_DEFAULT,
-                          chi_max=None, nchi=N_CHI_CL):
-        """Compute C_ell^LE using JAX."""
-        chi_gal = self.chi_of_z(Om, z_gal)
-        chi_max_actual = jnp.minimum(CHI_MAX_DEFAULT, chi_gal * 1.2) if chi_max is None else chi_max
-
-        chi_grid = jnp.linspace(chi_min, chi_max_actual, nchi)
+    def compute_Cl_LE_jax(self, Om, s8, ell, bin_idx, chi_min=CHI_MIN_DEFAULT,
+                          chi_max=CHI_MAX_DEFAULT, nchi=N_CHI_CL):
+        """Compute C_ell^LE using mean Q_L and distribution-averaged Q_E kernels."""
+        chi_grid = jnp.linspace(chi_min, chi_max, nchi)
         z_grid = self.z_of_chi(Om, chi_grid)
         k_grid = (ell + 0.5) / chi_grid
 
         QL = self.QL_mean(chi_grid, Om)
-        QE = self.QE(Om, chi_grid, chi_gal)
+        QE = self.QE_mean(Om, chi_grid, bin_idx)
         Pk = vmap(lambda z, k: self.Pk_interp(Om, s8, z, k))(z_grid, k_grid)
 
         integrand = QL * QE * Pk
@@ -417,121 +506,76 @@ class TheoryJAX:
         return Cl
 
     @partial(jit, static_argnums=(0,))
-    def compute_Cl_LP_jax(self, Om, s8, ell, z_gal):
-        """Compute C_ell^LP using JAX - delta function means direct evaluation."""
-        chi_gal = self.chi_of_z(Om, z_gal)
-        k_at_gal = (ell + 0.5) / chi_gal
-
-        QP_coeff = self.galaxy_bias(z_gal) / chi_gal
-        QL_at_gal = self.QL_mean(chi_gal, Om)
-        Pk_at_gal = self.Pk_interp(Om, s8, z_gal, k_at_gal)
-
-        Cl = QL_at_gal * QP_coeff * Pk_at_gal
-
-        return Cl
-
-    @partial(jit, static_argnums=(0,))
-    def compute_Cl_EE_jax(self, Om, s8, ell, z_gal, chi_min=CHI_MIN_DEFAULT,
-                          chi_max=None, nchi=N_CHI_CL):
-        """
-        Compute C_ell^EE - cosmic shear auto-correlation.
-
-        Uses Q_E × Q_E kernel (no Q_L lensing component).
-        """
-        chi_gal = self.chi_of_z(Om, z_gal)
-        chi_max_actual = jnp.minimum(CHI_MAX_DEFAULT, chi_gal * 1.2) if chi_max is None else chi_max
-
-        chi_grid = jnp.linspace(chi_min, chi_max_actual, nchi)
+    def compute_Cl_LP_jax(self, Om, s8, ell, bin_idx, chi_min=CHI_MIN_DEFAULT,
+                          chi_max=CHI_MAX_DEFAULT, nchi=N_CHI_CL):
+        """Compute C_ell^LP using mean Q_L and distribution-averaged Q_P kernels."""
+        chi_grid = jnp.linspace(chi_min, chi_max, nchi)
         z_grid = self.z_of_chi(Om, chi_grid)
         k_grid = (ell + 0.5) / chi_grid
 
-        QE = self.QE(Om, chi_grid, chi_gal)  # Cosmic shear kernel
+        QL = self.QL_mean(chi_grid, Om)
+        QP = self.QP_mean(Om, chi_grid, bin_idx)
         Pk = vmap(lambda z, k: self.Pk_interp(Om, s8, z, k))(z_grid, k_grid)
 
-        integrand = QE * QE * Pk  # QE squared
+        integrand = QL * QP * Pk
         Cl = jnp.trapezoid(integrand, chi_grid)
 
         return Cl
 
     @partial(jit, static_argnums=(0,))
-    def compute_Cl_EP_jax(self, Om, s8, ell, z_gal, chi_min=CHI_MIN_DEFAULT,
-                          chi_max=None, nchi=N_CHI_CL):
+    def compute_Cl_EE_jax(self, Om, s8, ell, bin_idx, chi_min=CHI_MIN_DEFAULT,
+                          chi_max=CHI_MAX_DEFAULT, nchi=N_CHI_CL):
         """
-        Compute C_ell^EP - cosmic shear × position cross-correlation.
+        Compute C_ell^EE - cosmic shear auto-correlation.
 
-        This is galaxy-galaxy lensing: shear of background sources
-        correlated with positions of foreground galaxies.
-
-        For the position (P), we have a delta function at z_gal.
-        For the shear (E), we integrate over matter between us and sources beyond z_gal.
-
-        We use an effective source distribution extending beyond z_gal.
+        Uses distribution-averaged Q_E × Q_E kernels.
         """
-        chi_gal = self.chi_of_z(Om, z_gal)
-
-        # For EP, we need sources beyond the lens galaxies
-        # Use sources extending from chi_gal to some higher redshift
-        # Conservative choice: integrate from chi_gal to chi_gal * 1.5 (or CHI_MAX)
-        chi_min_sources = chi_gal
-        chi_max_sources = jnp.minimum(CHI_MAX_DEFAULT, chi_gal * 1.5) if chi_max is None else chi_max
-
-        # If chi_min_sources >= chi_max_sources, there are no sources beyond
-        # In this case, return zero (no galaxy-galaxy lensing signal)
-        chi_range = chi_max_sources - chi_min_sources
-
-        # Integration over the source distribution
-        # For simplicity, assume uniform source distribution beyond z_gal
-        chi_grid = jnp.linspace(chi_min_sources, chi_max_sources, nchi)
+        chi_grid = jnp.linspace(chi_min, chi_max, nchi)
         z_grid = self.z_of_chi(Om, chi_grid)
         k_grid = (ell + 0.5) / chi_grid
 
-        # Position kernel at lens redshift (delta function → direct evaluation at chi_gal)
-        QP_coeff = self.galaxy_bias(z_gal) / chi_gal
+        QE = self.QE_mean(Om, chi_grid, bin_idx)
+        Pk = vmap(lambda z, k: self.Pk_interp(Om, s8, z, k))(z_grid, k_grid)
 
-        # Shear kernel: QE(chi, chi_source) for sources at chi_source > chi_gal
-        # We evaluate at chi = chi_gal (where the lenses are)
-        # But average over source positions chi_source
-
-        # For each source position, get QE at the lens position
-        def integrand_for_source(chi_source):
-            QE_at_lens = self.QE(Om, chi_gal, chi_source)  # Shear at lens from sources at chi_source
-            k_at_source = (ell + 0.5) / chi_source
-            z_source = self.z_of_chi(Om, chi_source)
-            Pk = self.Pk_interp(Om, s8, z_source, k_at_source)
-            return QE_at_lens * Pk
-
-        # Integrate over source distribution
-        from jax import vmap
-        integrands = vmap(integrand_for_source)(chi_grid)
-        integral = jnp.trapezoid(integrands, chi_grid)
-
-        # Normalize by source distribution extent
-        # (This is a simplified uniform weighting)
-        n_source_norm = 1.0 / jnp.maximum(chi_range, 1.0)
-
-        Cl = QP_coeff * integral * n_source_norm
-
-        # Handle edge case where there's no range
-        Cl = jnp.where(chi_range > 10.0, Cl, 0.0)
+        integrand = QE * QE * Pk
+        Cl = jnp.trapezoid(integrand, chi_grid)
 
         return Cl
 
     @partial(jit, static_argnums=(0,))
-    def compute_Cl_PP_jax(self, Om, s8, ell, z_gal):
+    def compute_Cl_EP_jax(self, Om, s8, ell, bin_idx, chi_min=CHI_MIN_DEFAULT,
+                          chi_max=CHI_MAX_DEFAULT, nchi=N_CHI_CL):
+        """
+        Compute C_ell^EP - cosmic shear × position cross-correlation.
+
+        Uses distribution-averaged Q_E and Q_P kernels.
+        """
+        chi_grid = jnp.linspace(chi_min, chi_max, nchi)
+        z_grid = self.z_of_chi(Om, chi_grid)
+        k_grid = (ell + 0.5) / chi_grid
+
+        QE = self.QE_mean(Om, chi_grid, bin_idx)
+        QP = self.QP_mean(Om, chi_grid, bin_idx)
+        Pk = vmap(lambda z, k: self.Pk_interp(Om, s8, z, k))(z_grid, k_grid)
+        Cl = jnp.trapezoid(QE * QP * Pk, chi_grid)
+
+        return Cl
+
+    @partial(jit, static_argnums=(0,))
+    def compute_Cl_PP_jax(self, Om, s8, ell, bin_idx, chi_min=CHI_MIN_DEFAULT,
+                          chi_max=CHI_MAX_DEFAULT, nchi=N_CHI_CL):
         """
         Compute C_ell^PP - galaxy clustering auto-correlation.
 
-        Uses squared galaxy bias kernel.
-        Delta function means direct evaluation.
+        Uses distribution-averaged Q_P × Q_P kernels.
         """
-        chi_gal = self.chi_of_z(Om, z_gal)
-        k_at_gal = (ell + 0.5) / chi_gal
+        chi_grid = jnp.linspace(chi_min, chi_max, nchi)
+        z_grid = self.z_of_chi(Om, chi_grid)
+        k_grid = (ell + 0.5) / chi_grid
 
-        b_gal = self.galaxy_bias(z_gal)
-        QP_coeff = b_gal / chi_gal
-        Pk_at_gal = self.Pk_interp(Om, s8, z_gal, k_at_gal)
-
-        Cl = QP_coeff * QP_coeff * Pk_at_gal  # Squared position bias
+        QP = self.QP_mean(Om, chi_grid, bin_idx)
+        Pk = vmap(lambda z, k: self.Pk_interp(Om, s8, z, k))(z_grid, k_grid)
+        Cl = jnp.trapezoid(QP * QP * Pk, chi_grid)
         return Cl
 
     @partial(jit, static_argnums=(0,))
@@ -647,11 +691,13 @@ class TheoryJAX:
         self.theta_LL_plus = jnp.array(ang_dist['LL_plus'].Thetas)
         self.theta_LL_minus = jnp.array(ang_dist['LL_minus'].Thetas)
 
-        # Dynamically detect number of tomographic bins
-        self.n_tomo_bins = len(ang_dist['LE_plus'])
-        self.theta_LE_plus = [jnp.array(ang_dist['LE_plus'][i].Thetas) for i in range(self.n_tomo_bins)]
-        self.theta_LE_minus = [jnp.array(ang_dist['LE_minus'][i].Thetas) for i in range(self.n_tomo_bins)]
-        self.theta_LP = [jnp.array(ang_dist['LP'][i].Thetas) for i in range(self.n_tomo_bins)]
+        # Dynamically detect number of tomographic bins for E/P probes.
+        self.n_tomo_bins_E = len(ang_dist['LE_plus'])
+        self.n_tomo_bins_P = len(ang_dist['LP'])
+        self.n_tomo_bins = self.n_tomo_bins_E
+        self.theta_LE_plus = [jnp.array(ang_dist['LE_plus'][i].Thetas) for i in range(self.n_tomo_bins_E)]
+        self.theta_LE_minus = [jnp.array(ang_dist['LE_minus'][i].Thetas) for i in range(self.n_tomo_bins_E)]
+        self.theta_LP = [jnp.array(ang_dist['LP'][i].Thetas) for i in range(self.n_tomo_bins_P)]
 
         # EE uses same structure as LE (plus/minus for cosmic shear)
         self.theta_EE_plus = self.theta_LE_plus  # Reuse LE plus bins
@@ -732,12 +778,12 @@ class TheoryJAX:
         predictions_parts.append(xi_LL_plus)
         predictions_parts.append(xi_LL_minus)
 
-        # LE predictions
-        z_edges = self.E_dist.limits
-        for bin_idx in range(self.n_tomo_bins):
-            z_gal = (z_edges[bin_idx] + z_edges[bin_idx + 1]) / 2.0
+        n_e_bins = len(self.theta_LE_plus)
+        n_p_bins = len(self.theta_LP)
 
-            Cl_LE_vals = vmap(lambda ell: self.compute_Cl_LE_jax(Om, s8, ell, z_gal))(ell_grid)
+        # LE predictions
+        for bin_idx in range(n_e_bins):
+            Cl_LE_vals = vmap(lambda ell: self.compute_Cl_LE_jax(Om, s8, ell, bin_idx))(ell_grid)
 
             xi_LE_plus = self.hankel_j0(Cl_LE_vals, ell_grid, self.theta_LE_plus[bin_idx])
             xi_LE_minus = self.hankel_j4(Cl_LE_vals, ell_grid, self.theta_LE_minus[bin_idx])
@@ -745,19 +791,15 @@ class TheoryJAX:
             predictions_parts.append(xi_LE_minus)
 
         # LP predictions
-        for bin_idx in range(self.n_tomo_bins):
-            z_gal = (z_edges[bin_idx] + z_edges[bin_idx + 1]) / 2.0
-
-            Cl_LP_vals = vmap(lambda ell: self.compute_Cl_LP_jax(Om, s8, ell, z_gal))(ell_grid)
+        for bin_idx in range(n_p_bins):
+            Cl_LP_vals = vmap(lambda ell: self.compute_Cl_LP_jax(Om, s8, ell, bin_idx))(ell_grid)
 
             xi_LP = self.hankel_j2(Cl_LP_vals, ell_grid, self.theta_LP[bin_idx])
             predictions_parts.append(xi_LP)
 
         # EE predictions (cosmic shear auto-correlation)
-        for bin_idx in range(self.n_tomo_bins):
-            z_gal = (z_edges[bin_idx] + z_edges[bin_idx + 1]) / 2.0
-
-            Cl_EE_vals = vmap(lambda ell: self.compute_Cl_EE_jax(Om, s8, ell, z_gal))(ell_grid)
+        for bin_idx in range(n_e_bins):
+            Cl_EE_vals = vmap(lambda ell: self.compute_Cl_EE_jax(Om, s8, ell, bin_idx))(ell_grid)
 
             xi_EE_plus = self.hankel_j0(Cl_EE_vals, ell_grid, self.theta_EE_plus[bin_idx])
             xi_EE_minus = self.hankel_j4(Cl_EE_vals, ell_grid, self.theta_EE_minus[bin_idx])
@@ -765,19 +807,15 @@ class TheoryJAX:
             predictions_parts.append(xi_EE_minus)
 
         # EP predictions (cosmic shear × position cross-correlation)
-        for bin_idx in range(self.n_tomo_bins):
-            z_gal = (z_edges[bin_idx] + z_edges[bin_idx + 1]) / 2.0
-
-            Cl_EP_vals = vmap(lambda ell: self.compute_Cl_EP_jax(Om, s8, ell, z_gal))(ell_grid)
+        for bin_idx in range(min(n_e_bins, n_p_bins)):
+            Cl_EP_vals = vmap(lambda ell: self.compute_Cl_EP_jax(Om, s8, ell, bin_idx))(ell_grid)
 
             xi_EP = self.hankel_j2(Cl_EP_vals, ell_grid, self.theta_EP[bin_idx])
             predictions_parts.append(xi_EP)
 
         # PP predictions (galaxy clustering auto-correlation)
-        for bin_idx in range(self.n_tomo_bins):
-            z_gal = (z_edges[bin_idx] + z_edges[bin_idx + 1]) / 2.0
-
-            Cl_PP_vals = vmap(lambda ell: self.compute_Cl_PP_jax(Om, s8, ell, z_gal))(ell_grid)
+        for bin_idx in range(n_p_bins):
+            Cl_PP_vals = vmap(lambda ell: self.compute_Cl_PP_jax(Om, s8, ell, bin_idx))(ell_grid)
 
             xi_PP = self.hankel_j2(Cl_PP_vals, ell_grid, self.theta_PP[bin_idx])
             predictions_parts.append(xi_PP)
