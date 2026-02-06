@@ -95,6 +95,9 @@ class FisherForecast:
         self.C_LL_inv = None
         self.C_LE_inv = None
         self.C_LP_inv = None
+        self.C_EE_inv = None
+        self.C_EP_inv = None
+        self.C_PP_inv = None
         self.sizes = None
         self._is_setup = False
 
@@ -175,8 +178,12 @@ class FisherForecast:
         self.C_full, self.sizes = build_full_covariance(self.cov_blocks)
         if self.verbose:
             print(f"  Shape: {self.C_full.shape}")
-            print(f"  Data vector sizes: n_LL={self.sizes['n_LL']}, "
-                  f"n_LE={self.sizes['n_LE']}, n_LP={self.sizes['n_LP']}")
+            size_str = f"  Data vector sizes: n_LL={self.sizes['n_LL']}, " \
+                      f"n_LE={self.sizes['n_LE']}, n_LP={self.sizes['n_LP']}"
+            if 'n_EE' in self.sizes:
+                size_str += f", n_EE={self.sizes['n_EE']}, n_EP={self.sizes['n_EP']}, " \
+                           f"n_PP={self.sizes['n_PP']}"
+            print(size_str)
 
         # Invert covariance
         if self.verbose:
@@ -205,6 +212,7 @@ class FisherForecast:
             print("Pre-computing covariance block inverses...")
         n_LL = self.sizes['n_LL']
         n_LE = self.sizes['n_LE']
+        n_LP = self.sizes['n_LP']
 
         self.C_LL_inv = self._robust_symmetric_inverse(
             self.C_full[:n_LL, :n_LL],
@@ -215,11 +223,42 @@ class FisherForecast:
             verbose=False
         )
         self.C_LP_inv = self._robust_symmetric_inverse(
-            self.C_full[n_LL + n_LE:, n_LL + n_LE:],
+            self.C_full[n_LL + n_LE:n_LL + n_LE + n_LP, n_LL + n_LE:n_LL + n_LE + n_LP],
             verbose=False
         )
-        if self.verbose:
-            print("  Block inverses cached!")
+
+        # Check if new blocks exist (6-probe case)
+        if 'n_EE' in self.sizes:
+            n_EE = self.sizes['n_EE']
+            n_EP = self.sizes['n_EP']
+            n_PP = self.sizes['n_PP']
+
+            # Compute EE block inverse
+            start_EE = n_LL + n_LE + n_LP
+            self.C_EE_inv = self._robust_symmetric_inverse(
+                self.C_full[start_EE:start_EE + n_EE, start_EE:start_EE + n_EE],
+                verbose=False
+            )
+
+            # Compute EP block inverse
+            start_EP = start_EE + n_EE
+            self.C_EP_inv = self._robust_symmetric_inverse(
+                self.C_full[start_EP:start_EP + n_EP, start_EP:start_EP + n_EP],
+                verbose=False
+            )
+
+            # Compute PP block inverse
+            start_PP = start_EP + n_EP
+            self.C_PP_inv = self._robust_symmetric_inverse(
+                self.C_full[start_PP:, start_PP:],
+                verbose=False
+            )
+
+            if self.verbose:
+                print("  All block inverses cached (including EE, EP, PP)!")
+        else:
+            if self.verbose:
+                print("  Block inverses cached!")
 
         self._is_setup = True
         if self.verbose:
@@ -278,7 +317,7 @@ class FisherForecast:
         # Extract sizes
         n_LL = self.sizes['n_LL']
         n_LE = self.sizes['n_LE']
-        # n_LP = self.sizes['n_LP'] # not needed
+        n_LP = self.sizes['n_LP']
 
         # Compute Fisher for each probe
         if self.verbose:
@@ -313,7 +352,7 @@ class FisherForecast:
         # LP only (using pre-computed inverse)
         if self.verbose:
             print("\n3. LP only:")
-        J_LP = self.jacobian[n_LL + n_LE:, :]
+        J_LP = self.jacobian[n_LL + n_LE:n_LL + n_LE + n_LP, :]
         C_LP_inv = jnp.array(self.C_LP_inv)
         F_LP = J_LP.T @ C_LP_inv @ J_LP
         self.fisher_matrices['LP'] = np.array(F_LP)
@@ -322,9 +361,59 @@ class FisherForecast:
         )
         self._print_constraints('LP')
 
-        # Combined
-        if self.verbose:
-            print("\n4. Combined (LL + LE + LP):")
+        # Check if new probes exist (6-probe case)
+        if 'n_EE' in self.sizes:
+            n_EE = self.sizes['n_EE']
+            n_EP = self.sizes['n_EP']
+            # n_PP = self.sizes['n_PP']
+
+            # EE only
+            if self.verbose:
+                print("\n4. EE only:")
+            start_EE = n_LL + n_LE + n_LP
+            J_EE = self.jacobian[start_EE:start_EE + n_EE, :]
+            C_EE_inv = jnp.array(self.C_EE_inv)
+            F_EE = J_EE.T @ C_EE_inv @ J_EE
+            self.fisher_matrices['EE'] = np.array(F_EE)
+            self.constraints['EE'] = self._analyze_constraints(
+                self.fisher_matrices['EE'], fiducial
+            )
+            self._print_constraints('EE')
+
+            # EP only
+            if self.verbose:
+                print("\n5. EP only:")
+            start_EP = start_EE + n_EE
+            J_EP = self.jacobian[start_EP:start_EP + n_EP, :]
+            C_EP_inv = jnp.array(self.C_EP_inv)
+            F_EP = J_EP.T @ C_EP_inv @ J_EP
+            self.fisher_matrices['EP'] = np.array(F_EP)
+            self.constraints['EP'] = self._analyze_constraints(
+                self.fisher_matrices['EP'], fiducial
+            )
+            self._print_constraints('EP')
+
+            # PP only
+            if self.verbose:
+                print("\n6. PP only:")
+            start_PP = start_EP + n_EP
+            J_PP = self.jacobian[start_PP:, :]
+            C_PP_inv = jnp.array(self.C_PP_inv)
+            F_PP = J_PP.T @ C_PP_inv @ J_PP
+            self.fisher_matrices['PP'] = np.array(F_PP)
+            self.constraints['PP'] = self._analyze_constraints(
+                self.fisher_matrices['PP'], fiducial
+            )
+            self._print_constraints('PP')
+
+            # Combined (all 6 probes)
+            if self.verbose:
+                print("\n7. Combined (all 6 probes: LL + LE + LP + EE + EP + PP):")
+        else:
+            # Combined (3 probes only)
+            if self.verbose:
+                print("\n4. Combined (LL + LE + LP):")
+
         F_combined = self.jacobian.T @ C_inv_jax @ self.jacobian
         self.fisher_matrices['Combined'] = np.array(F_combined)
         self.constraints['Combined'] = self._analyze_constraints(
@@ -342,6 +431,77 @@ class FisherForecast:
             'constraints': self.constraints,
             'fiducial': fiducial,
             'param_names': param_names,
+        }
+
+    def compute_custom_fisher(self, probe_names: List[str]) -> Dict:
+        """
+        Compute Fisher matrix for a custom combination of probes.
+
+        Args:
+            probe_names: List of probe names to combine, e.g. ['LL', 'EE', 'PP']
+
+        Returns:
+            Dictionary with Fisher matrix and constraints for the combination
+        """
+        if not self._is_setup:
+            raise RuntimeError("Must call setup() and compute_fisher() first")
+
+        # Build index mask for selected probes
+        probe_indices = []
+        n_LL = self.sizes['n_LL']
+        n_LE = self.sizes['n_LE']
+        n_LP = self.sizes['n_LP']
+
+        offsets = {
+            'LL': (0, n_LL),
+            'LE': (n_LL, n_LL + n_LE),
+            'LP': (n_LL + n_LE, n_LL + n_LE + n_LP),
+        }
+
+        # Add new probe offsets if they exist
+        if 'n_EE' in self.sizes:
+            n_EE = self.sizes['n_EE']
+            n_EP = self.sizes['n_EP']
+            n_PP = self.sizes['n_PP']
+            offsets['EE'] = (n_LL + n_LE + n_LP, n_LL + n_LE + n_LP + n_EE)
+            offsets['EP'] = (n_LL + n_LE + n_LP + n_EE, n_LL + n_LE + n_LP + n_EE + n_EP)
+            offsets['PP'] = (n_LL + n_LE + n_LP + n_EE + n_EP, n_LL + n_LE + n_LP + n_EE + n_EP + n_PP)
+
+        for probe in probe_names:
+            if probe not in offsets:
+                raise ValueError(f"Unknown probe: {probe}")
+            start, end = offsets[probe]
+            probe_indices.extend(range(start, end))
+
+        probe_indices = np.array(probe_indices)
+
+        # Extract Jacobian and covariance for selected probes
+        J_custom = self.jacobian[probe_indices, :]
+        C_custom = self.C_full[np.ix_(probe_indices, probe_indices)]
+        C_custom_inv = self._robust_symmetric_inverse(C_custom, verbose=False)
+
+        # Compute Fisher matrix
+        F_custom = J_custom.T @ jnp.array(C_custom_inv) @ J_custom
+        F_custom = np.array(F_custom)
+
+        # Analyze constraints
+        constraints = self._analyze_constraints(F_custom, self.fiducial)
+
+        probe_label = '+'.join(probe_names)
+
+        if self.verbose:
+            print(f"\nCustom combination: {probe_label}")
+            if constraints:
+                print(f"   sigma(Omega_m) = {constraints['errors'][0]:.4f} "
+                      f"({100 * constraints['fractional_errors'][0]:.1f}%)")
+                print(f"   sigma(sigma_8) = {constraints['errors'][1]:.4f} "
+                      f"({100 * constraints['fractional_errors'][1]:.1f}%)")
+
+        return {
+            'fisher_matrix': F_custom,
+            'constraints': constraints,
+            'fiducial': self.fiducial,
+            'probe_combination': probe_label,
         }
 
     def _robust_symmetric_inverse(self, M: np.ndarray, verbose: bool = False) -> np.ndarray:
@@ -442,6 +602,22 @@ class FisherForecast:
         self.cov_blocks['LELP'] = slice_block(self.cov_blocks['LELP'], idx_LE, idx_LP)
         self.cov_blocks['LLLP'] = slice_block(self.cov_blocks['LLLP'], idx_LL, idx_LP)
 
+        # Handle new probe blocks if they exist
+        if 'EEEE' in self.cov_blocks:
+            # EE uses same mask structure as LE (plus/minus)
+            idx_EE = idx_LE
+
+            # EP and PP use same mask structure as LP
+            idx_EP = idx_LP
+            idx_PP = idx_LP
+
+            self.cov_blocks['EEEE'] = slice_block(self.cov_blocks['EEEE'], idx_EE, idx_EE)
+            self.cov_blocks['EPEP'] = slice_block(self.cov_blocks['EPEP'], idx_EP, idx_EP)
+            self.cov_blocks['PPPP'] = slice_block(self.cov_blocks['PPPP'], idx_PP, idx_PP)
+            self.cov_blocks['EEEP'] = slice_block(self.cov_blocks['EEEP'], idx_EE, idx_EP)
+            self.cov_blocks['EEPP'] = slice_block(self.cov_blocks['EEPP'], idx_EE, idx_PP)
+            self.cov_blocks['EPPP'] = slice_block(self.cov_blocks['EPPP'], idx_EP, idx_PP)
+
     def _analyze_constraints(self, F: np.ndarray, fiducial: List[float]) -> Optional[Dict]:
         """Extract parameter constraints from Fisher matrix."""
         try:
@@ -484,19 +660,26 @@ class FisherForecast:
         output_path = Path(output_file)
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
+        metadata = {
+            'timestamp': datetime.now().isoformat(),
+            'data_dir': str(self.data_dir),
+            'dataset_info': self.dataset_info,
+            'n_LL': self.sizes['n_LL'],
+            'n_LE': self.sizes['n_LE'],
+            'n_LP': self.sizes['n_LP'],
+            'nbins': self.nbins,
+        }
+        # Add new probe sizes if they exist
+        if 'n_EE' in self.sizes:
+            metadata['n_EE'] = self.sizes['n_EE']
+            metadata['n_EP'] = self.sizes['n_EP']
+            metadata['n_PP'] = self.sizes['n_PP']
+
         results_dict = {
             'fisher_matrices': self.fisher_matrices,
             'constraints': self.constraints,
             'fiducial': self.fiducial,
-            'metadata': {
-                'timestamp': datetime.now().isoformat(),
-                'data_dir': str(self.data_dir),
-                'dataset_info': self.dataset_info,
-                'n_LL': self.sizes['n_LL'],
-                'n_LE': self.sizes['n_LE'],
-                'n_LP': self.sizes['n_LP'],
-                'nbins': self.nbins,
-            }
+            'metadata': metadata
         }
 
         with open(output_path, 'wb') as f:
