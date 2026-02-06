@@ -431,6 +431,110 @@ class TheoryJAX:
         return Cl
 
     @partial(jit, static_argnums=(0,))
+    def compute_Cl_EE_jax(self, Om, s8, ell, z_gal, chi_min=CHI_MIN_DEFAULT,
+                          chi_max=None, nchi=N_CHI_CL):
+        """
+        Compute C_ell^EE - cosmic shear auto-correlation.
+
+        Uses Q_E × Q_E kernel (no Q_L lensing component).
+        """
+        chi_gal = self.chi_of_z(Om, z_gal)
+        chi_max_actual = jnp.minimum(CHI_MAX_DEFAULT, chi_gal * 1.2) if chi_max is None else chi_max
+
+        chi_grid = jnp.linspace(chi_min, chi_max_actual, nchi)
+        z_grid = self.z_of_chi(Om, chi_grid)
+        k_grid = (ell + 0.5) / chi_grid
+
+        QE = self.QE(Om, chi_grid, chi_gal)  # Cosmic shear kernel
+        Pk = vmap(lambda z, k: self.Pk_interp(Om, s8, z, k))(z_grid, k_grid)
+
+        integrand = QE * QE * Pk  # QE squared
+        Cl = jnp.trapezoid(integrand, chi_grid)
+
+        return Cl
+
+    @partial(jit, static_argnums=(0,))
+    def compute_Cl_EP_jax(self, Om, s8, ell, z_gal, chi_min=CHI_MIN_DEFAULT,
+                          chi_max=None, nchi=N_CHI_CL):
+        """
+        Compute C_ell^EP - cosmic shear × position cross-correlation.
+
+        This is galaxy-galaxy lensing: shear of background sources
+        correlated with positions of foreground galaxies.
+
+        For the position (P), we have a delta function at z_gal.
+        For the shear (E), we integrate over matter between us and sources beyond z_gal.
+
+        We use an effective source distribution extending beyond z_gal.
+        """
+        chi_gal = self.chi_of_z(Om, z_gal)
+
+        # For EP, we need sources beyond the lens galaxies
+        # Use sources extending from chi_gal to some higher redshift
+        # Conservative choice: integrate from chi_gal to chi_gal * 1.5 (or CHI_MAX)
+        chi_min_sources = chi_gal
+        chi_max_sources = jnp.minimum(CHI_MAX_DEFAULT, chi_gal * 1.5) if chi_max is None else chi_max
+
+        # If chi_min_sources >= chi_max_sources, there are no sources beyond
+        # In this case, return zero (no galaxy-galaxy lensing signal)
+        chi_range = chi_max_sources - chi_min_sources
+
+        # Integration over the source distribution
+        # For simplicity, assume uniform source distribution beyond z_gal
+        chi_grid = jnp.linspace(chi_min_sources, chi_max_sources, nchi)
+        z_grid = self.z_of_chi(Om, chi_grid)
+        k_grid = (ell + 0.5) / chi_grid
+
+        # Position kernel at lens redshift (delta function → direct evaluation at chi_gal)
+        QP_coeff = self.galaxy_bias(z_gal) / chi_gal
+
+        # Shear kernel: QE(chi, chi_source) for sources at chi_source > chi_gal
+        # We evaluate at chi = chi_gal (where the lenses are)
+        # But average over source positions chi_source
+
+        # For each source position, get QE at the lens position
+        def integrand_for_source(chi_source):
+            QE_at_lens = self.QE(Om, chi_gal, chi_source)  # Shear at lens from sources at chi_source
+            k_at_source = (ell + 0.5) / chi_source
+            z_source = self.z_of_chi(Om, chi_source)
+            Pk = self.Pk_interp(Om, s8, z_source, k_at_source)
+            return QE_at_lens * Pk
+
+        # Integrate over source distribution
+        from jax import vmap
+        integrands = vmap(integrand_for_source)(chi_grid)
+        integral = jnp.trapezoid(integrands, chi_grid)
+
+        # Normalize by source distribution extent
+        # (This is a simplified uniform weighting)
+        n_source_norm = 1.0 / jnp.maximum(chi_range, 1.0)
+
+        Cl = QP_coeff * integral * n_source_norm
+
+        # Handle edge case where there's no range
+        Cl = jnp.where(chi_range > 10.0, Cl, 0.0)
+
+        return Cl
+
+    @partial(jit, static_argnums=(0,))
+    def compute_Cl_PP_jax(self, Om, s8, ell, z_gal):
+        """
+        Compute C_ell^PP - galaxy clustering auto-correlation.
+
+        Uses squared galaxy bias kernel.
+        Delta function means direct evaluation.
+        """
+        chi_gal = self.chi_of_z(Om, z_gal)
+        k_at_gal = (ell + 0.5) / chi_gal
+
+        b_gal = self.galaxy_bias(z_gal)
+        QP_coeff = b_gal / chi_gal
+        Pk_at_gal = self.Pk_interp(Om, s8, z_gal, k_at_gal)
+
+        Cl = QP_coeff * QP_coeff * Pk_at_gal  # Squared position bias
+        return Cl
+
+    @partial(jit, static_argnums=(0,))
     def bessel_j0(self, x):
         """
         Bessel function of the first kind, order 0.
@@ -549,6 +653,16 @@ class TheoryJAX:
         self.theta_LE_minus = [jnp.array(ang_dist['LE_minus'][i].Thetas) for i in range(self.n_tomo_bins)]
         self.theta_LP = [jnp.array(ang_dist['LP'][i].Thetas) for i in range(self.n_tomo_bins)]
 
+        # EE uses same structure as LE (plus/minus for cosmic shear)
+        self.theta_EE_plus = self.theta_LE_plus  # Reuse LE plus bins
+        self.theta_EE_minus = self.theta_LE_minus  # Reuse LE minus bins
+
+        # PP uses same structure as LP (galaxy clustering)
+        self.theta_PP = self.theta_LP  # Reuse LP bins
+
+        # EP uses LP structure (no plus/minus for cross-correlation)
+        self.theta_EP = self.theta_LP  # Reuse LP bins
+
     def apply_theta_min_cut(self, theta_min_arcmin: Optional[float] = None):
         """
         Apply a minimum-angle cut (in arcmin) to all angular bins.
@@ -583,6 +697,13 @@ class TheoryJAX:
         self.theta_LE_plus = [_filter(arr, f'LE_plus_{i}') for i, arr in enumerate(self.theta_LE_plus)]
         self.theta_LE_minus = [_filter(arr, f'LE_minus_{i}') for i, arr in enumerate(self.theta_LE_minus)]
         self.theta_LP = [_filter(arr, f'LP_{i}') for i, arr in enumerate(self.theta_LP)]
+
+        # EE, EP, PP automatically filtered since they reference the same arrays
+        # Just update the references after filtering
+        self.theta_EE_plus = self.theta_LE_plus
+        self.theta_EE_minus = self.theta_LE_minus
+        self.theta_PP = self.theta_LP
+        self.theta_EP = self.theta_LP
 
     def predict_data_vector_jax(self, Om, s8, ell_grid=None):
         """
@@ -631,6 +752,35 @@ class TheoryJAX:
 
             xi_LP = self.hankel_j2(Cl_LP_vals, ell_grid, self.theta_LP[bin_idx])
             predictions_parts.append(xi_LP)
+
+        # EE predictions (cosmic shear auto-correlation)
+        for bin_idx in range(self.n_tomo_bins):
+            z_gal = (z_edges[bin_idx] + z_edges[bin_idx + 1]) / 2.0
+
+            Cl_EE_vals = vmap(lambda ell: self.compute_Cl_EE_jax(Om, s8, ell, z_gal))(ell_grid)
+
+            xi_EE_plus = self.hankel_j0(Cl_EE_vals, ell_grid, self.theta_EE_plus[bin_idx])
+            xi_EE_minus = self.hankel_j4(Cl_EE_vals, ell_grid, self.theta_EE_minus[bin_idx])
+            predictions_parts.append(xi_EE_plus)
+            predictions_parts.append(xi_EE_minus)
+
+        # EP predictions (cosmic shear × position cross-correlation)
+        for bin_idx in range(self.n_tomo_bins):
+            z_gal = (z_edges[bin_idx] + z_edges[bin_idx + 1]) / 2.0
+
+            Cl_EP_vals = vmap(lambda ell: self.compute_Cl_EP_jax(Om, s8, ell, z_gal))(ell_grid)
+
+            xi_EP = self.hankel_j2(Cl_EP_vals, ell_grid, self.theta_EP[bin_idx])
+            predictions_parts.append(xi_EP)
+
+        # PP predictions (galaxy clustering auto-correlation)
+        for bin_idx in range(self.n_tomo_bins):
+            z_gal = (z_edges[bin_idx] + z_edges[bin_idx + 1]) / 2.0
+
+            Cl_PP_vals = vmap(lambda ell: self.compute_Cl_PP_jax(Om, s8, ell, z_gal))(ell_grid)
+
+            xi_PP = self.hankel_j2(Cl_PP_vals, ell_grid, self.theta_PP[bin_idx])
+            predictions_parts.append(xi_PP)
 
         return jnp.concatenate(predictions_parts)
 
