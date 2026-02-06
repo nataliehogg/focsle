@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "focsle"
 version = "0.1.0"
 description = "Fisher Forecasting for Cosmological Strong Lensing Experiments"
-requires-python = ">=3.9"
+requires-python = ">=3.12"
 dependencies = [
     "numpy",
     "jax",
