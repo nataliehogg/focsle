@@ -57,7 +57,7 @@ def _register_pickling_shims():
             if hasattr(self, 'starting_distribution') and self.starting_distribution is not None:
                 z_norm = np.linspace(zzmin, zzmax, 256)
                 overall = self.overall_distribution(z_norm)
-                norm = float(np.trapz(overall, z_norm))
+                norm = float(np.trapezoid(overall, z_norm))
                 if norm > 0.0:
                     return float(self.overall_distribution(z_val) / norm)
 

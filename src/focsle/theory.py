@@ -348,14 +348,14 @@ class TheoryJAX:
             pdf = in_bin.astype(float) / width
 
         pdf = np.clip(pdf, 0.0, None)
-        norm = float(np.trapz(pdf, z_grid))
+        norm = float(np.trapezoid(pdf, z_grid))
 
         if not np.isfinite(norm) or norm <= 0.0:
             # Robust fallback so setup remains usable with incomplete legacy pickles.
             z_mid = 0.5 * (z_min + z_max)
             sigma = max(0.25 * (z_max - z_min), 1e-3)
             pdf = np.exp(-0.5 * ((z_grid - z_mid) / sigma) ** 2)
-            norm = float(np.trapz(pdf, z_grid))
+            norm = float(np.trapezoid(pdf, z_grid))
 
         return pdf / max(norm, 1e-12)
 
@@ -434,7 +434,7 @@ class TheoryJAX:
         K_matrix = np.where(chi_col < chi_src_row, (chi_src_row - chi_col) / chi_src_row, 0.0)
 
         for b in range(self.Nbinz_E):
-            KE_mean_np[b, :] = np.trapz(K_matrix * E_pdf_np[b][None, :], z_pdf_np, axis=1)
+            KE_mean_np[b, :] = np.trapezoid(K_matrix * E_pdf_np[b][None, :], z_pdf_np, axis=1)
 
         self.chi_QE_grid = jnp.array(chi_grid_np)
         self.KE_mean_grid = jnp.array(KE_mean_np)

@@ -117,7 +117,7 @@ def test_redshift_pickling_shim_pb():
     dist.Nbinz = 2
     dist.starting_distribution = redshift_distribution_Euclid
     z_norm = np.linspace(0.0, 3.0, 4096)
-    dist.norm_factor = np.trapz(redshift_distribution_Euclid(z_norm), z_norm)
+    dist.norm_factor = np.trapezoid(redshift_distribution_Euclid(z_norm), z_norm)
 
     pb_in = dist.pb(0.25, 0)
     pb_out = dist.pb(0.75, 0)
