@@ -9,7 +9,7 @@ description = "Fisher Forecasting for Cosmological Strong Lensing Experiments"
 requires-python = ">=3.12"
 dependencies = [
     "numpy",
-    "jax",
+    "jax[cuda12]",
     "jaxlib",
     "camb",
     "matplotlib",
