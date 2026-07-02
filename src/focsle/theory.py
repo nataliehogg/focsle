@@ -52,7 +52,10 @@ CHI_MAX_DEFAULT = 8000.0  # Maximum comoving distance (Mpc) - covers z~2-3
 CHI_MAX_QL_GRID = 10000.0  # Larger range for Q_L kernel grid
 
 # Default number of grid points for numerical integrations
-N_CHI_CL = 100   # Points for C_ell integrals over comoving distance
+# N_CHI_CL: 400 keeps the sharp tomographic-bin edges in Q_P well resolved as
+# they sweep through the chi grid with Omega_m; at 100 points the resulting
+# ripples in D(Omega_m) made dD/dOm noisy at the tens-of-percent level for LP.
+N_CHI_CL = 400   # Points for C_ell integrals over comoving distance
 N_CHI_QL = 200   # Points for Q_L kernel pre-computation (higher accuracy needed)
 N_Z_KERNEL = 256  # Points for redshift-bin averaging in Q_E/Q_P precomputation
 
@@ -214,8 +217,20 @@ class TheoryJAX:
         # Also setup background cosmology interpolators
         self._setup_background(Om_grid, verbose=verbose)
 
-    def _setup_background(self, Om_grid, verbose: bool = True):
-        """Setup background cosmology table chi(z) over Omega_m grid."""
+    def _setup_background(self, Om_grid, verbose: bool = True,
+                          n_Om_min: int = 101):
+        """Setup background cosmology table chi(z) over Omega_m grid.
+
+        Uses a denser Omega_m grid than the P(k) grid: background CAMB calls
+        are cheap, and the kernel geometry tables (and their autodiff
+        Om-derivatives) inherit this grid's resolution. Autodiff returns the
+        local slope of the piecewise-linear interpolation, so the grid spacing
+        directly sets the noise level of dD/dOm; 101 points over the default
+        Om range keeps this at the few-percent level.
+        """
+        n_Om = max(len(Om_grid), n_Om_min)
+        Om_grid = np.linspace(Om_grid[0], Om_grid[-1], n_Om)
+
         z_arr = np.linspace(0, 7, 500)
         chi_table = np.zeros((len(Om_grid), len(z_arr)))
 
@@ -382,70 +397,94 @@ class TheoryJAX:
     def _precompute_QL_mean(self, chi_min: float = CHI_MIN_DEFAULT,
                             chi_max: float = CHI_MAX_QL_GRID,
                             nchi: int = N_CHI_QL, verbose: bool = True):
-        """Pre-compute mean LOS geometry kernel K_LOS(chi), averaged over lenses."""
+        """Pre-compute mean LOS geometry kernel K_LOS(chi), averaged over lenses.
+
+        Tabulated on the Omega_m grid so the geometric response (lens/source
+        distances shifting with cosmology) survives autodiff; a single
+        fiducial-Om table would freeze dK/dOm to zero and bias the Fisher
+        derivatives.
+        """
         chi_grid_np = np.linspace(chi_min, chi_max, nchi)
-        KL_mean_np = np.zeros(nchi)
+        Om_grid_np = np.array(self.Om_bg)
+        KL_mean_np = np.zeros((len(Om_grid_np), nchi))
 
         if verbose:
-            print("Pre-computing mean LOS kernel...")
+            print("Pre-computing mean LOS kernel on Omega_m grid...")
 
-        Om_fid = self.cosmo_fid['Omega_m']
-        chi_d_np = np.array(self.chi_of_z(Om_fid, jnp.array(self.z_d_array)))
-        chi_s_np = np.array(self.chi_of_z(Om_fid, jnp.array(self.z_s_array)))
-
-        for j, chi in enumerate(chi_grid_np):
-            chi_safe = max(chi, 1e-6)
+        chi_col = chi_grid_np[:, None]  # (nchi, 1) vs lens arrays (1, N_lenses)
+        for iOm, Om in enumerate(Om_grid_np):
+            chi_d_row = np.array(self.chi_of_z(Om, jnp.array(self.z_d_array)))[None, :]
+            chi_s_row = np.array(self.chi_of_z(Om, jnp.array(self.z_s_array)))[None, :]
             K_vals = np.where(
-                chi < chi_d_np,
+                chi_col < chi_d_row,
                 0.0,
                 np.where(
-                    chi < chi_s_np,
-                    (chi - chi_d_np) / chi_safe,
-                    (chi_s_np - chi_d_np) / chi_safe,
+                    chi_col < chi_s_row,
+                    (chi_col - chi_d_row) / chi_col,
+                    (chi_s_row - chi_d_row) / chi_col,
                 ),
             )
-            KL_mean_np[j] = float(np.mean(K_vals))
+            KL_mean_np[iOm, :] = K_vals.mean(axis=1)
 
         # Transfer to JAX/GPU
         self.chi_QL_grid = jnp.array(chi_grid_np)
         self.KL_mean_grid = jnp.array(KL_mean_np)
 
         if verbose:
-            print(f"  Mean LOS kernel ready on GPU ({nchi} points)")
+            print(f"  Mean LOS kernel ready on GPU "
+                  f"({len(Om_grid_np)} Om points x {nchi} chi points)")
 
     def _precompute_QE_mean(self, chi_min: float = CHI_MIN_DEFAULT,
                             chi_max: float = CHI_MAX_QL_GRID,
                             nchi: int = N_CHI_QL, verbose: bool = True):
-        """Pre-compute mean weak-lensing geometry kernel K_E(chi) for each E bin."""
+        """Pre-compute mean weak-lensing geometry kernel K_E(chi) for each E bin.
+
+        Tabulated on the Omega_m grid (see _precompute_QL_mean) so that the
+        source-distance response to cosmology survives autodiff.
+        """
         chi_grid_np = np.linspace(chi_min, chi_max, nchi)
-        KE_mean_np = np.zeros((self.Nbinz_E, nchi))
+        Om_grid_np = np.array(self.Om_bg)
+        KE_mean_np = np.zeros((len(Om_grid_np), self.Nbinz_E, nchi))
 
         if verbose:
-            print("Pre-computing mean E-kernels...")
+            print("Pre-computing mean E-kernels on Omega_m grid...")
 
-        Om_fid = self.cosmo_fid['Omega_m']
         z_pdf_np = np.array(self.z_pdf_grid)
         E_pdf_np = np.array(self.E_pdf_table)
-        chi_source_fid = np.array(self.chi_of_z(Om_fid, jnp.array(z_pdf_np)))
-        chi_source_safe = np.maximum(chi_source_fid, 1e-6)
-
         chi_col = chi_grid_np[:, None]
-        chi_src_row = chi_source_safe[None, :]
-        K_matrix = np.where(chi_col < chi_src_row, (chi_src_row - chi_col) / chi_src_row, 0.0)
 
-        for b in range(self.Nbinz_E):
-            KE_mean_np[b, :] = np.trapezoid(K_matrix * E_pdf_np[b][None, :], z_pdf_np, axis=1)
+        for iOm, Om in enumerate(Om_grid_np):
+            chi_source = np.array(self.chi_of_z(Om, jnp.array(z_pdf_np)))
+            chi_src_row = np.maximum(chi_source, 1e-6)[None, :]
+            K_matrix = np.where(chi_col < chi_src_row,
+                                (chi_src_row - chi_col) / chi_src_row, 0.0)
+
+            for b in range(self.Nbinz_E):
+                KE_mean_np[iOm, b, :] = np.trapezoid(
+                    K_matrix * E_pdf_np[b][None, :], z_pdf_np, axis=1)
 
         self.chi_QE_grid = jnp.array(chi_grid_np)
         self.KE_mean_grid = jnp.array(KE_mean_np)
 
         if verbose:
-            print(f"  Mean E-kernels ready on GPU ({self.Nbinz_E} bins, {nchi} chi points)")
+            print(f"  Mean E-kernels ready on GPU ({len(Om_grid_np)} Om points, "
+                  f"{self.Nbinz_E} bins, {nchi} chi points)")
+
+    @partial(jit, static_argnums=(0,))
+    def _Om_interp_row(self, table, Om):
+        """Linear interpolation of a table's leading Omega_m axis."""
+        iOm = (Om - self.Om_bg[0]) / (self.Om_bg[-1] - self.Om_bg[0]) * (len(self.Om_bg) - 1)
+        iOm = jnp.clip(iOm, 0.0, len(self.Om_bg) - 1.001)
+        Om_low = jnp.floor(iOm).astype(int)
+        Om_high = jnp.minimum(Om_low + 1, len(self.Om_bg) - 1)
+        t_Om = iOm - Om_low
+        return (1.0 - t_Om) * table[Om_low] + t_Om * table[Om_high]
 
     @partial(jit, static_argnums=(0,))
     def QL_mean(self, chi, Om):
-        """Mean LOS lensing kernel using precomputed geometry and live cosmology."""
-        K = jnp.interp(chi, self.chi_QL_grid, self.KL_mean_grid)
+        """Mean LOS lensing kernel with Omega_m-dependent geometry."""
+        K_row = self._Om_interp_row(self.KL_mean_grid, Om)
+        K = jnp.interp(chi, self.chi_QL_grid, K_row)
         z = self.z_of_chi(Om, chi)
         prefactor = -(3.0 / 2.0) * Om * (self.cosmo_fid['H0'] ** 2) / (self.c_km_s ** 2)
         return prefactor * (1 + z) * K
@@ -458,7 +497,9 @@ class TheoryJAX:
     @partial(jit, static_argnums=(0,))
     def QE_mean(self, Om, chi, bin_idx):
         """Mean Q_E kernel averaged over source redshift distribution in one E bin."""
-        K = jnp.interp(chi, self.chi_QE_grid, self.KE_mean_grid[bin_idx])
+        K_table = jnp.take(self.KE_mean_grid, bin_idx, axis=1)  # (nOm, nchi)
+        K_row = self._Om_interp_row(K_table, Om)
+        K = jnp.interp(chi, self.chi_QE_grid, K_row)
         z = self.z_of_chi(Om, chi)
         prefactor = -(3.0 / 2.0) * Om * (self.cosmo_fid['H0'] ** 2) / (self.c_km_s ** 2)
         return prefactor * (1 + z) * K
