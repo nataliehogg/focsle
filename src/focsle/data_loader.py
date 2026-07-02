@@ -268,9 +268,14 @@ def load_covariance_block(cov_type_dir: str, nbins: int) -> np.ndarray:
             scov_file = cov_type_dir / f'scov_{i}_{j}'
 
         if not ccov_file.exists():
-            ccov_file = cov_type_dir / 'ccov'
-            ncov_file = cov_type_dir / 'ncov'
-            scov_file = cov_type_dir / 'scov'
+            # No fallback: reaching the per-bin branch means the single-file
+            # format ('ccov') is absent, so a missing per-bin file is an error.
+            raise FileNotFoundError(
+                f"Missing per-bin covariance file '{ccov_file.name}' for {cov_name} "
+                f"bin pair ({i}, {j}) in {cov_type_dir}. The directory has neither "
+                f"the single-file format ('ccov') nor a complete set of per-bin "
+                f"files - was the covariance generation interrupted?"
+            )
 
         with open(ccov_file, 'rb') as f:
             ccov = pickle.load(f)
