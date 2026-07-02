@@ -117,7 +117,8 @@ class FisherForecast:
     def setup(self, nOm: int = 5, nAs: int = 5, nz: int = 50, nk: int = 100,
               Om_range: Tuple[float, float] = (0.25, 0.40),
               As_range: Tuple[float, float] = (1.5e-9, 2.7e-9),
-              theta_min_arcmin: Optional[float] = None):
+              theta_min_arcmin: Optional[float] = None,
+              rcond: float = 1e-10):
         """
         Setup the forecast calculator.
 
@@ -132,7 +133,12 @@ class FisherForecast:
             Om_range: (min, max) range for Omega_m
             As_range: (min, max) range for A_s
             theta_min_arcmin: Minimum theta (arcmin); angular bins below are cut
+            rcond: Relative eigenvalue threshold for covariance pseudo-inverses;
+                   modes with eig <= rcond * max(eig) are projected out (they
+                   sit at/below the Monte Carlo noise floor of the simulated
+                   covariance). Check constraint stability against this value.
         """
+        self.rcond = rcond
         if self.verbose:
             print("=" * 70)
             print("Setting up Fisher Forecast")
@@ -201,7 +207,8 @@ class FisherForecast:
                     RuntimeWarning
                 )
 
-            self.C_inv = self._robust_symmetric_inverse(self.C_full, verbose=self.verbose)
+            self.C_inv = self._robust_symmetric_inverse(self.C_full, verbose=self.verbose,
+                                                        label='full covariance')
             if self.verbose:
                 print("  Success!")
         except np.linalg.LinAlgError:
@@ -216,15 +223,15 @@ class FisherForecast:
 
         self.C_LL_inv = self._robust_symmetric_inverse(
             self.C_full[:n_LL, :n_LL],
-            verbose=False
+            verbose=False, label='LLLL'
         )
         self.C_LE_inv = self._robust_symmetric_inverse(
             self.C_full[n_LL:n_LL + n_LE, n_LL:n_LL + n_LE],
-            verbose=False
+            verbose=False, label='LELE'
         )
         self.C_LP_inv = self._robust_symmetric_inverse(
             self.C_full[n_LL + n_LE:n_LL + n_LE + n_LP, n_LL + n_LE:n_LL + n_LE + n_LP],
-            verbose=False
+            verbose=False, label='LPLP'
         )
 
         # Check if new blocks exist (6-probe case)
@@ -237,21 +244,21 @@ class FisherForecast:
             start_EE = n_LL + n_LE + n_LP
             self.C_EE_inv = self._robust_symmetric_inverse(
                 self.C_full[start_EE:start_EE + n_EE, start_EE:start_EE + n_EE],
-                verbose=False
+                verbose=False, label='EEEE'
             )
 
             # Compute EP block inverse
             start_EP = start_EE + n_EE
             self.C_EP_inv = self._robust_symmetric_inverse(
                 self.C_full[start_EP:start_EP + n_EP, start_EP:start_EP + n_EP],
-                verbose=False
+                verbose=False, label='EPEP'
             )
 
             # Compute PP block inverse
             start_PP = start_EP + n_EP
             self.C_PP_inv = self._robust_symmetric_inverse(
                 self.C_full[start_PP:, start_PP:],
-                verbose=False
+                verbose=False, label='PPPP'
             )
 
             if self.verbose:
@@ -430,25 +437,40 @@ class FisherForecast:
             if self.verbose:
                 print("\n4. Combined (LL + LE + LP):")
 
-        # Use block-diagonal sum rather than F = J^T C^{-1} J with the full covariance inverse.
-        # The full matrix inversion is numerically unstable when probes share the Q_L kernel
-        # (strongly correlated), causing C_inv to blow up and yield unphysical constraints.
-        # Summing individual Fisher matrices is the block-diagonal approximation; it slightly
-        # overestimates the combined information (ignores cross-probe covariances) but gives
-        # stable, physically meaningful results.
-        F_combined = (self.fisher_matrices['LL'] +
-                      self.fisher_matrices['LE'] +
-                      self.fisher_matrices['LP'])
-        if 'n_EE' in self.sizes:
-            F_combined = (F_combined +
-                          self.fisher_matrices['EE'] +
-                          self.fisher_matrices['EP'] +
-                          self.fisher_matrices['PP'])
-        self.fisher_matrices['Combined'] = F_combined
+        # Full-covariance combined Fisher: F = J^T C^+ J, where C^+ is the
+        # pseudo-inverse of the full covariance (noise-floor modes projected
+        # out by _robust_symmetric_inverse). This retains the cross-probe
+        # covariances, which are large here because all probes share the Q_L
+        # kernel; ignoring them double-counts shared information.
+        # Check stability of these constraints against setup(rcond=...).
+        F_combined = self.jacobian.T @ C_inv_jax @ self.jacobian
+        self.fisher_matrices['Combined'] = np.array(F_combined)
         self.constraints['Combined'] = self._analyze_constraints(
             self.fisher_matrices['Combined'], fiducial
         )
         self._print_constraints('Combined')
+
+        # Also record the independent-probes approximation (sum of per-probe
+        # Fisher matrices == zeroed cross-probe covariances). The gap between
+        # this and 'Combined' measures the effect of cross-probe correlations.
+        # Note this is not a bound in either direction: correlations between
+        # probes can remove information (shared sample variance) or add it
+        # (correlated-noise cancellation between probes).
+        F_independent = (self.fisher_matrices['LL'] +
+                         self.fisher_matrices['LE'] +
+                         self.fisher_matrices['LP'])
+        if 'n_EE' in self.sizes:
+            F_independent = (F_independent +
+                             self.fisher_matrices['EE'] +
+                             self.fisher_matrices['EP'] +
+                             self.fisher_matrices['PP'])
+        self.fisher_matrices['Combined_independent'] = F_independent
+        self.constraints['Combined_independent'] = self._analyze_constraints(
+            F_independent, fiducial
+        )
+        if self.verbose:
+            print("\n   (for comparison) independent-probes approximation:")
+        self._print_constraints('Combined_independent')
 
         if self.verbose:
             print("\n" + "=" * 70)
@@ -512,7 +534,8 @@ class FisherForecast:
         # Extract Jacobian and covariance for selected probes
         J_custom = self.jacobian[probe_indices, :]
         C_custom = self.C_full[np.ix_(probe_indices, probe_indices)]
-        C_custom_inv = self._robust_symmetric_inverse(C_custom, verbose=False)
+        C_custom_inv = self._robust_symmetric_inverse(C_custom, verbose=False,
+                                                      label='+'.join(probe_names))
 
         # Compute Fisher matrix
         F_custom = J_custom.T @ jnp.array(C_custom_inv) @ J_custom
@@ -538,63 +561,69 @@ class FisherForecast:
             'probe_combination': probe_label,
         }
 
-    def _robust_symmetric_inverse(self, M: np.ndarray, verbose: bool = False) -> np.ndarray:
+    def _robust_symmetric_inverse(self, M: np.ndarray, verbose: bool = False,
+                                  rcond: Optional[float] = None,
+                                  label: str = '') -> np.ndarray:
         """
-        Compute a robust inverse of a symmetric matrix.
+        Compute a symmetric pseudo-inverse, projecting out unusable modes.
 
-        For ill-conditioned matrices, the standard inverse can produce
-        asymmetric results or matrices that are not positive definite.
-        This method:
-        1. Ensures input matrix is positive definite (clips negative eigenvalues)
-        2. Computes the inverse
-        3. Symmetrizes to remove asymmetric numerical errors
-        4. Ensures output is positive definite
+        Covariance blocks are assembled from independently Monte-Carlo-
+        integrated elements (loscov), so the matrix is not guaranteed positive
+        definite: eigenvalues at or below the MC noise floor can come out
+        near-zero or negative. Such modes carry no reliable information, so
+        they are DISCARDED (inverse eigenvalue set to zero = zero Fisher
+        weight along that direction). This is the conservative treatment;
+        the previous behaviour (clipping eigenvalues up to max*1e-10 and
+        inverting) gave those same modes enormous spurious weight instead.
 
         Args:
             M: Symmetric matrix to invert
             verbose: Print diagnostic information
+            rcond: Relative eigenvalue threshold; modes with
+                   eig <= rcond * max(eig) are discarded.
+                   Defaults to self.rcond (set in __init__ / setup()).
+            label: Name used in the warning message
 
         Returns:
-            Robust symmetric positive-definite inverse
+            Symmetric positive-semidefinite pseudo-inverse
         """
-        # First, ensure input matrix is positive definite
+        if rcond is None:
+            rcond = getattr(self, 'rcond', 1e-10)
+
         M_sym = (M + M.T) / 2  # Symmetrize input
-        eigenvalues_M, eigenvectors_M = np.linalg.eigh(M_sym)
+        eigenvalues, eigenvectors = np.linalg.eigh(M_sym)
 
-        if np.any(eigenvalues_M <= 0):
-            # Regularize input matrix by clipping negative eigenvalues
-            min_positive = np.max(eigenvalues_M) * 1e-10
-            n_clipped = np.sum(eigenvalues_M <= 0)
-            eigenvalues_M_clipped = np.maximum(eigenvalues_M, min_positive)
+        lam_max = eigenvalues[-1]
+        if lam_max <= 0:
+            raise np.linalg.LinAlgError(
+                f"Covariance matrix {label or ''} has no positive eigenvalues"
+            )
 
+        threshold = rcond * lam_max
+        keep = eigenvalues > threshold
+        n_discarded = int(np.sum(~keep))
+
+        if n_discarded > 0:
+            # Always warn: silently altering the information content is what
+            # made the old clipping behaviour dangerous.
+            import warnings
+            warnings.warn(
+                f"Covariance pseudo-inverse{f' [{label}]' if label else ''}: "
+                f"discarded {n_discarded}/{len(eigenvalues)} modes with "
+                f"eigenvalue <= {threshold:.3e} (rcond={rcond:g}, "
+                f"{int(np.sum(eigenvalues <= 0))} were non-positive). "
+                "These data directions contribute zero Fisher information.",
+                RuntimeWarning,
+            )
             if verbose:
-                print(f"  Regularized input matrix: clipped {n_clipped} non-positive eigenvalues")
+                print(f"  Pseudo-inverse: kept {int(np.sum(keep))}/{len(eigenvalues)} modes "
+                      f"(condition number of kept subspace: "
+                      f"{lam_max / eigenvalues[keep].min():.2e})")
 
-            # Reconstruct positive definite input
-            M_regularized = eigenvectors_M @ np.diag(eigenvalues_M_clipped) @ eigenvectors_M.T
-        else:
-            M_regularized = M_sym
+        inv_eigenvalues = np.where(keep, 1.0 / np.where(keep, eigenvalues, 1.0), 0.0)
+        M_inv = (eigenvectors * inv_eigenvalues) @ eigenvectors.T
 
-        # Compute raw inverse and symmetrize
-        M_inv_raw = np.linalg.inv(M_regularized)
-        M_inv_sym = (M_inv_raw + M_inv_raw.T) / 2
-
-        # Check if inverse is positive definite
-        eigenvalues_inv, eigenvectors_inv = np.linalg.eigh(M_inv_sym)
-
-        if np.any(eigenvalues_inv <= 0):
-            # Clip negative/zero eigenvalues to small positive value
-            min_positive = np.max(eigenvalues_inv) * 1e-10
-            n_clipped = np.sum(eigenvalues_inv <= 0)
-            eigenvalues_inv_clipped = np.maximum(eigenvalues_inv, min_positive)
-
-            if verbose:
-                print(f"  Clipped {n_clipped} non-positive eigenvalues in inverse for numerical stability")
-
-            # Reconstruct positive definite inverse
-            M_inv_sym = eigenvectors_inv @ np.diag(eigenvalues_inv_clipped) @ eigenvectors_inv.T
-
-        return M_inv_sym
+        return (M_inv + M_inv.T) / 2
 
     def _apply_theta_scale_cut(self):
         """Apply theta_min cut to covariance blocks to match theory predictions."""
