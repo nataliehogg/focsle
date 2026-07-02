@@ -5,7 +5,10 @@ This module provides functions for visualizing Fisher matrix constraints
 and comparing results from different datasets.
 """
 
+import math
+
 import numpy as np
+import matplotlib
 import matplotlib.pyplot as plt
 from matplotlib.patches import Ellipse
 from typing import Dict, List, Optional, Tuple
@@ -14,6 +17,21 @@ from pathlib import Path
 from matplotlib import rc
 rc('text', usetex=True)
 rc('font', family='serif', size=20)
+
+
+def _chi2_2d_scale(n_sigma: float) -> float:
+    """
+    Mahalanobis radius of the 2D ellipse containing the same probability
+    as the 1D n-sigma interval.
+
+    In 2D the squared Mahalanobis distance is chi^2 with 2 dof, so the
+    ellipse of radius Delta contains P = 1 - exp(-Delta^2/2). Matching the
+    1D n-sigma content p = erf(n/sqrt(2)) gives Delta = sqrt(-2 ln(1-p)):
+    1 sigma -> 1.515, 2 sigma -> 2.486 (Coe 2009, arXiv:0906.4123, Table 1).
+    """
+    p = math.erf(n_sigma / math.sqrt(2.0))
+    return math.sqrt(-2.0 * math.log(1.0 - p))
+
 
 def plot_fisher_ellipse(
     F: np.ndarray,
@@ -63,11 +81,13 @@ def plot_fisher_ellipse(
     # Plot contours
     sigmas = [1, 2] if show_2sigma else [1]
     alphas = [alpha_1sig, alpha_2sig]
-    linestyles = [linestyle, '-']
+    linestyles = [linestyle, linestyle]
 
     for i, n_sigma in enumerate(sigmas):
-        width = 2 * n_sigma * np.sqrt(eigenvalues[0])
-        height = 2 * n_sigma * np.sqrt(eigenvalues[1])
+        # 2D joint 68.3%/95.4% regions need Delta = 1.52/2.49, not n_sigma
+        scale = _chi2_2d_scale(n_sigma)
+        width = 2 * scale * np.sqrt(eigenvalues[0])
+        height = 2 * scale * np.sqrt(eigenvalues[1])
 
         ellipse = Ellipse(
             fiducial, width, height,
@@ -448,6 +468,89 @@ def plot_fom_comparison(
     if output_file:
         plt.savefig(output_file, dpi=150, bbox_inches='tight')
         print(f"Saved FoM comparison to {output_file}")
+
+    return fig
+
+
+def plot_constraints_chainconsumer(
+    results: Dict,
+    probes: List[str] = None,
+    colors: Dict[str, str] = None,
+    output_file: Optional[str] = None,
+) -> plt.Figure:
+    """
+    Cross-check contour plot using ChainConsumer instead of the native
+    ellipse plotter.
+
+    Builds one analytic Gaussian per probe via Chain.from_covariance,
+    centred on the fiducial with covariance C = F^{-1}, and lets
+    ChainConsumer draw the 68/95% contours. Since ChainConsumer computes
+    its contour levels independently, agreement with plot_fisher_ellipse /
+    plot_constraints_overlay validates the native ellipse scaling.
+
+    Requires the optional dependency chainconsumer (pip install chainconsumer).
+
+    Args:
+        results: Dictionary containing Fisher matrices and fiducial values
+        probes: List of probes to plot (default: ['LL', 'LE', 'LP'])
+        colors: Dictionary mapping probe names to colors
+        output_file: If provided, save figure to this path
+
+    Returns:
+        Matplotlib figure
+    """
+    try:
+        from chainconsumer import Chain, ChainConsumer
+    except ImportError as exc:
+        raise ImportError(
+            "plot_constraints_chainconsumer requires the optional "
+            "'chainconsumer' package: pip install chainconsumer"
+        ) from exc
+
+    if probes is None:
+        probes = ['LL', 'LE', 'LP']
+
+    probes = [p for p in probes if p in results.get('fisher_matrices', {})]
+    if not probes:
+        raise ValueError("No valid probes found in results")
+
+    if colors is None:
+        colors = {
+            'LL': 'steelblue',
+            'LE': 'forestgreen',
+            'LP': 'coral',
+            'Combined': 'purple',
+        }
+
+    fiducial = np.asarray(results['fiducial'], dtype=float)
+    columns = [r'$\Omega_{\rm m}$', r'$\sigma_8$']
+
+    consumer = ChainConsumer()
+    for probe in probes:
+        F = np.asarray(results['fisher_matrices'][probe], dtype=float)
+        try:
+            C = np.linalg.inv(F)
+        except np.linalg.LinAlgError:
+            print(f"Warning: Singular Fisher matrix for {probe}, skipping")
+            continue
+
+        chain_kwargs = {}
+        if colors.get(probe):
+            # ChainConsumer only accepts hex codes, not matplotlib color names
+            chain_kwargs['color'] = matplotlib.colors.to_hex(colors[probe])
+
+        consumer.add_chain(Chain.from_covariance(
+            fiducial, C,
+            columns=columns,
+            name=probe,
+            **chain_kwargs,
+        ))
+
+    fig = consumer.plotter.plot()
+
+    if output_file:
+        fig.savefig(output_file, dpi=150, bbox_inches='tight')
+        print(f"Saved ChainConsumer plot to {output_file}")
 
     return fig
 

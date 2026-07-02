@@ -21,6 +21,7 @@ dev = [
     "ipykernel",
     "pytest>=7.0",
     "scipy",  # Needed for test comparisons
+    "chainconsumer",  # Optional cross-check for the native ellipse plotter
 ]
 
 [tool.setuptools.packages.find]

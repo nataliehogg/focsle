@@ -50,6 +50,7 @@ from .plotting import (
     plot_comparison,
     print_constraints_table,
     plot_fom_comparison,
+    plot_constraints_chainconsumer,
 )
 
 __version__ = '0.1.0'
@@ -79,4 +80,5 @@ __all__ = [
     'plot_comparison',
     'print_constraints_table',
     'plot_fom_comparison',
+    'plot_constraints_chainconsumer',
 ]
