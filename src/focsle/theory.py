@@ -34,14 +34,17 @@ except RuntimeError:
 # =============================================================================
 
 # Redshift grid defaults for P(k) computation
-# Maximum redshift covers typical source galaxies in strong lensing surveys
-Z_MAX_CAMB = 3.5  # Maximum redshift for CAMB P(k) grid
+# Covers z(chi) over the full Limber integration range (chi_max = 8000 Mpc
+# corresponds to z ~ 4.3); queries beyond the grid clamp to the edge.
+Z_MAX_CAMB = 4.6  # Maximum redshift for CAMB P(k) grid
 Z_MIN_CAMB = 0.0  # Minimum redshift (today)
 
-# Wavenumber grid defaults for P(k) computation (in h/Mpc)
-# Range chosen to cover scales relevant for weak lensing and galaxy clustering
-K_MIN_CAMB = 1e-4  # Minimum k (h/Mpc) - large scales
-K_MAX_CAMB = 10.0  # Maximum k (h/Mpc) - small scales (10 h/Mpc ~ 0.6 Mpc)
+# Wavenumber grid defaults for P(k) computation.
+# NOTE units: plain 1/Mpc (the interpolator is built with hubble_units=False,
+# k_hunit=False, and CAMB's set_matter_power kmax is also "just k, not k/h").
+# Queries beyond K_MAX are power-law extrapolated in Pk_interp.
+K_MIN_CAMB = 1e-4  # Minimum k (1/Mpc) - large scales
+K_MAX_CAMB = 10.0  # Maximum k (1/Mpc) - small scales
 
 # Comoving distance grid defaults (in Mpc)
 # Range covers typical lens-source separations in strong lensing
@@ -59,11 +62,18 @@ N_CHI_CL = 400   # Points for C_ell integrals over comoving distance
 N_CHI_QL = 200   # Points for Q_L kernel pre-computation (higher accuracy needed)
 N_Z_KERNEL = 256  # Points for redshift-bin averaging in Q_E/Q_P precomputation
 
-# Angular multipole defaults for Hankel transforms
-# Range chosen to capture angular scales from arcmin to degrees
-ELL_MIN_DEFAULT = 1.0      # Minimum multipole (large angular scales)
-ELL_MAX_DEFAULT = 10**3.5  # Maximum multipole (~3162, corresponds to ~arcmin)
-N_ELL_DEFAULT = 80         # Number of ell points for Hankel transform
+# Angular multipole defaults: grid on which C_ell is computed and then
+# log-log interpolated (power-law tails) inside the Ogata Hankel transforms.
+# The wide range keeps the Ogata nodes ell = x_k/theta inside the grid for
+# the data's angular range; beyond it the power-law tail takes over.
+ELL_MIN_DEFAULT = 0.1      # Minimum multipole
+ELL_MAX_DEFAULT = 1e6      # Maximum multipole
+N_ELL_DEFAULT = 300        # Number of ell points for the C_ell grid
+
+# Ogata (2005) quadrature settings for the Hankel transforms
+# (same scheme and parameters as the `hankel` package used by loscov)
+OGATA_N = 10000  # number of Bessel-zero nodes
+OGATA_H = 1e-2   # step parameter
 
 
 class TheoryJAX:
@@ -115,6 +125,43 @@ class TheoryJAX:
         self.lens_file = lens_file
         self._setup_lens_distribution()
         self.theta_masks = {}
+
+        # Precompute Ogata quadrature nodes/weights for J0, J2, J4 Hankel
+        # transforms (constants; computed once with scipy, used by JAX).
+        self._ogata = {nu: self._ogata_nodes(nu) for nu in (0, 2, 4)}
+
+    @staticmethod
+    def _ogata_nodes(nu: int, N: int = OGATA_N, h: float = OGATA_H):
+        """
+        Nodes x_k and combined weights W_k for Ogata (2005) quadrature:
+
+            int_0^inf g(x) J_nu(x) dx  ~=  sum_k W_k g(x_k)
+
+        with x_k = (pi/h) psi(h r_k), r_k = (k-th zero of J_nu)/pi,
+        psi(t) = t tanh((pi/2) sinh t), and
+        W_k = pi * [Y_nu(pi r_k)/J_{nu+1}(pi r_k)] * J_nu(x_k) * psi'(h r_k).
+
+        This is the same scheme (and N, h) as the `hankel` package loscov
+        uses to build the data, chosen because the nodes sit at Bessel zeros
+        so the oscillating lobes cancel by construction - a plain trapezoid
+        rule cannot resolve the strong cancellation at large theta.
+        """
+        from scipy.special import jn_zeros, jv, yv
+
+        zeros = jn_zeros(nu, N)
+        r = zeros / np.pi
+        t = h * r
+        u = 0.5 * np.pi * np.sinh(t)
+        psi = t * np.tanh(u)
+        # psi'(t); sech^2(u) underflows to exactly 0 for large u, which is fine
+        sech2 = 1.0 / np.cosh(np.minimum(u, 350.0)) ** 2
+        sech2 = np.where(u < 350.0, sech2, 0.0)
+        dpsi = np.tanh(u) + t * 0.5 * np.pi * np.cosh(t) * sech2
+
+        x = (np.pi / h) * psi
+        W = np.pi * (yv(nu, np.pi * r) / jv(nu + 1, np.pi * r)) * jv(nu, x) * dpsi
+
+        return jnp.array(x), jnp.array(W)
 
     def _setup_lens_distribution(self):
         """Load lens catalog from file or use fallback."""
@@ -280,6 +327,12 @@ class TheoryJAX:
         """
         Interpolate P(k) from pre-computed grid - JAX multilinear interpolation.
 
+        k beyond the grid is power-law extrapolated (linear continuation in
+        log P vs log k, matching loscov's extrap_kmax behaviour). Clamping to
+        the edge value instead injects spurious non-decaying small-scale power
+        into high-ell C_ells, which swamps the correlation functions at large
+        theta. z and (Om, s8) outside the grid still clamp to the edge.
+
         Args:
             Om, s8: Cosmological parameters
             z, k: Redshift and wavenumber
@@ -302,14 +355,32 @@ class TheoryJAX:
         iAs = jnp.clip(iAs, 0.0, len(self.As_grid) - 1.001)
 
         # Remaining coordinates (z, k)
+        nk = len(self.k_grid)
         iz = (z - self.z_grid[0]) / (self.z_grid[-1] - self.z_grid[0]) * (len(self.z_grid) - 1)
-        ik = jnp.log(k / self.k_grid[0]) / jnp.log(self.k_grid[-1] / self.k_grid[0]) * (len(self.k_grid) - 1)
+        ik_raw = jnp.log(k / self.k_grid[0]) / jnp.log(self.k_grid[-1] / self.k_grid[0]) * (nk - 1)
         iz = jnp.clip(iz, 0.0, len(self.z_grid) - 1.001)
-        ik = jnp.clip(ik, 0.0, len(self.k_grid) - 1.001)
+        ik = jnp.clip(ik_raw, 0.0, nk - 1.001)
 
-        # 4D linear interpolation using map_coordinates
-        coords = jnp.array([[iOm], [iAs], [iz], [ik]])
-        return map_coordinates(self.Pk_grid, coords, order=1, mode='nearest')[0]
+        def P_at(ik_val):
+            coords = jnp.array([[iOm], [iAs], [iz], [ik_val]])
+            return map_coordinates(self.Pk_grid, coords, order=1, mode='nearest')[0]
+
+        P_in = P_at(ik)
+
+        # Power-law extrapolation beyond the k grid: the grid is log-spaced,
+        # so one index step is a constant step in log k, and the local
+        # log-log slope at the edge continues the spectrum.
+        i_hi = nk - 1.001
+        logP_hi = jnp.log(P_at(jnp.asarray(i_hi)))
+        slope_hi = logP_hi - jnp.log(P_at(jnp.asarray(i_hi - 1.0)))
+        P_hi = jnp.exp(logP_hi + slope_hi * (ik_raw - i_hi))
+
+        logP_lo = jnp.log(P_at(jnp.asarray(0.0)))
+        slope_lo = jnp.log(P_at(jnp.asarray(1.0))) - logP_lo
+        P_lo = jnp.exp(logP_lo + slope_lo * ik_raw)
+
+        return jnp.where(ik_raw > i_hi, P_hi,
+                         jnp.where(ik_raw < 0.0, P_lo, P_in))
 
     def setup_galaxy_distributions(self, data_dir: str, verbose: bool = True):
         """
@@ -415,15 +486,16 @@ class TheoryJAX:
         for iOm, Om in enumerate(Om_grid_np):
             chi_d_row = np.array(self.chi_of_z(Om, jnp.array(self.z_d_array)))[None, :]
             chi_s_row = np.array(self.chi_of_z(Om, jnp.array(self.z_s_array)))[None, :]
-            K_vals = np.where(
-                chi_col < chi_d_row,
-                0.0,
-                np.where(
-                    chi_col < chi_s_row,
-                    (chi_col - chi_d_row) / chi_col,
-                    (chi_s_row - chi_d_row) / chi_col,
-                ),
-            )
+            # Strong-lensing LOS convergence weight, matching loscov
+            # (functions/correlations/LL.py): K = os + od - ds, each term
+            # active only where positive. Vanishes behind the source.
+            os_w = (chi_s_row - chi_col) / chi_s_row
+            od_w = (chi_d_row - chi_col) / chi_d_row
+            ds_w = ((chi_col - chi_d_row) * (chi_s_row - chi_col)
+                    / (chi_col * (chi_s_row - chi_d_row)))
+            K_vals = (os_w * np.heaviside(os_w, 0.0)
+                      + od_w * np.heaviside(od_w, 0.0)
+                      - ds_w * np.heaviside(ds_w, 0.0))
             KL_mean_np[iOm, :] = K_vals.mean(axis=1)
 
         # Transfer to JAX/GPU
@@ -650,70 +722,74 @@ class TheoryJAX:
         return bessel_jn(x, v=4)[4]
 
     @partial(jit, static_argnums=(0,))
+    def _cl_eval(self, Cl_vals, ell_grid, ell_query):
+        """
+        Evaluate C(ell) at arbitrary multipoles from a computed grid.
+
+        Inside the grid: linear interpolation in log(ell).
+        Outside: power-law continuation using the log-log slope at the grid
+        edge (scaling the signed edge value, so negative spectra work).
+        """
+        log_grid = jnp.log(ell_grid)
+        log_q = jnp.log(ell_query)
+        C_in = jnp.interp(log_q, log_grid, Cl_vals)
+
+        tiny = 1e-300
+        # high-ell power-law tail
+        slope_hi = ((jnp.log(jnp.abs(Cl_vals[-1]) + tiny)
+                     - jnp.log(jnp.abs(Cl_vals[-2]) + tiny))
+                    / (log_grid[-1] - log_grid[-2]))
+        C_hi = Cl_vals[-1] * jnp.exp(slope_hi * (log_q - log_grid[-1]))
+        # low-ell power-law tail
+        slope_lo = ((jnp.log(jnp.abs(Cl_vals[1]) + tiny)
+                     - jnp.log(jnp.abs(Cl_vals[0]) + tiny))
+                    / (log_grid[1] - log_grid[0]))
+        C_lo = Cl_vals[0] * jnp.exp(slope_lo * (log_q - log_grid[0]))
+
+        return jnp.where(log_q > log_grid[-1], C_hi,
+                         jnp.where(log_q < log_grid[0], C_lo, C_in))
+
+    @partial(jit, static_argnums=(0,))
+    def _hankel_ogata(self, Cl_func_values, ell_grid, theta, x_nodes, W_nodes):
+        """
+        xi(theta) = 1/(2 pi) int ell C(ell) J_nu(ell theta) d ell,
+        computed with Ogata quadrature: substituting x = ell*theta,
+        xi(theta) = 1/(2 pi theta^2) sum_k W_k x_k C(x_k / theta).
+
+        The Bessel factor J_nu(x_k) is already inside W_k (piece 1), and
+        C is evaluated anywhere via _cl_eval (piece 2), so this is an
+        accurate oscillatory integral yet still a plain differentiable sum.
+        """
+        theta = jnp.asarray(theta)
+        scalar_theta = theta.ndim == 0
+        theta_vec = theta[None] if scalar_theta else theta
+
+        ell_q = x_nodes[:, None] / theta_vec[None, :]          # (N, n_theta)
+        C_q = self._cl_eval(Cl_func_values, ell_grid, ell_q)
+        xi = (W_nodes[:, None] * x_nodes[:, None] * C_q).sum(axis=0)
+        xi = xi / (2.0 * jnp.pi * theta_vec ** 2)
+        return xi[0] if scalar_theta else xi
+
     def hankel_j0(self, Cl_func_values, ell_grid, theta):
-        """Hankel transform with J0 Bessel function.
+        """Hankel transform with J0 Bessel function (Ogata quadrature).
 
         Args:
-            Cl_func_values: C_ell values, shape (n_ell,)
+            Cl_func_values: C_ell values on ell_grid, shape (n_ell,)
             ell_grid: ell values, shape (n_ell,)
             theta: scalar theta or array, shape (n_theta,)
 
         Returns:
             xi(theta) as a scalar (if theta is scalar) or array (n_theta,).
         """
-        theta = jnp.asarray(theta)
-        scalar_theta = theta.ndim == 0
-        theta_vec = theta[None] if scalar_theta else theta
+        return self._hankel_ogata(Cl_func_values, ell_grid, theta, *self._ogata[0])
 
-        x_grid = ell_grid[:, None] * theta_vec[None, :]
-        J0_vals = self.bessel_j0(x_grid)
-        integrand = (ell_grid * Cl_func_values)[:, None] * J0_vals / (2 * jnp.pi)
-        xi = jnp.trapezoid(integrand.T, ell_grid)
-        return xi[0] if scalar_theta else xi
-
-    @partial(jit, static_argnums=(0,))
     def hankel_j2(self, Cl_func_values, ell_grid, theta):
-        """Hankel transform with J2 Bessel function.
+        """Hankel transform with J2 Bessel function (Ogata quadrature)."""
+        return self._hankel_ogata(Cl_func_values, ell_grid, theta, *self._ogata[2])
 
-        Args:
-            Cl_func_values: C_ell values, shape (n_ell,)
-            ell_grid: ell values, shape (n_ell,)
-            theta: scalar theta or array, shape (n_theta,)
-
-        Returns:
-            xi(theta) as a scalar (if theta is scalar) or array (n_theta,).
-        """
-        theta = jnp.asarray(theta)
-        scalar_theta = theta.ndim == 0
-        theta_vec = theta[None] if scalar_theta else theta
-
-        x_grid = ell_grid[:, None] * theta_vec[None, :]
-        J2_vals = self.bessel_j2(x_grid)
-        integrand = (ell_grid * Cl_func_values)[:, None] * J2_vals / (2 * jnp.pi)
-        xi = jnp.trapezoid(integrand.T, ell_grid)
-        return xi[0] if scalar_theta else xi
-
-    @partial(jit, static_argnums=(0,))
     def hankel_j4(self, Cl_func_values, ell_grid, theta):
-        """Hankel transform with J4 Bessel function.
-
-        Args:
-            Cl_func_values: C_ell values, shape (n_ell,)
-            ell_grid: ell values, shape (n_ell,)
-            theta: scalar theta or array, shape (n_theta,)
-
-        Returns:
-            xi(theta) as a scalar (if theta is scalar) or array (n_theta,).
-        """
-        theta = jnp.asarray(theta)
-        scalar_theta = theta.ndim == 0
-        theta_vec = theta[None] if scalar_theta else theta
-
-        x_grid = ell_grid[:, None] * theta_vec[None, :]
-        J4_vals = self.bessel_j4(x_grid)
-        integrand = (ell_grid * Cl_func_values)[:, None] * J4_vals / (2 * jnp.pi)
-        xi = jnp.trapezoid(integrand.T, ell_grid)
-        return xi[0] if scalar_theta else xi
+        """Hankel transform with J4 Bessel function (Ogata quadrature)."""
+        return self._hankel_ogata(Cl_func_values, ell_grid, theta, *self._ogata[4])
 
     def load_angular_bins(self, data_dir: str):
         """
@@ -728,9 +804,13 @@ class TheoryJAX:
         with open(ang_file, 'rb') as f:
             ang_dist = pickle.load(f)
 
-        # Store angular grids for each observable
+        # Representative angles (bin centroids) - kept for scale cuts/reporting
         self.theta_LL_plus = jnp.array(ang_dist['LL_plus'].Thetas)
         self.theta_LL_minus = jnp.array(ang_dist['LL_minus'].Thetas)
+
+        # Bin-averaging nodes/weights (the data vector is annulus-averaged)
+        self.nodes_LL_plus, self.w_LL_plus = self._bin_average_nodes(ang_dist['LL_plus'])
+        self.nodes_LL_minus, self.w_LL_minus = self._bin_average_nodes(ang_dist['LL_minus'])
 
         # Dynamically detect number of tomographic bins for E/P probes.
         self.n_tomo_bins_E = len(ang_dist['LE_plus'])
@@ -739,6 +819,16 @@ class TheoryJAX:
         self.theta_LE_plus = [jnp.array(ang_dist['LE_plus'][i].Thetas) for i in range(self.n_tomo_bins_E)]
         self.theta_LE_minus = [jnp.array(ang_dist['LE_minus'][i].Thetas) for i in range(self.n_tomo_bins_E)]
         self.theta_LP = [jnp.array(ang_dist['LP'][i].Thetas) for i in range(self.n_tomo_bins_P)]
+
+        le_plus_nw = [self._bin_average_nodes(ang_dist['LE_plus'][i]) for i in range(self.n_tomo_bins_E)]
+        le_minus_nw = [self._bin_average_nodes(ang_dist['LE_minus'][i]) for i in range(self.n_tomo_bins_E)]
+        lp_nw = [self._bin_average_nodes(ang_dist['LP'][i]) for i in range(self.n_tomo_bins_P)]
+        self.nodes_LE_plus = [n for n, _ in le_plus_nw]
+        self.w_LE_plus = [w for _, w in le_plus_nw]
+        self.nodes_LE_minus = [n for n, _ in le_minus_nw]
+        self.w_LE_minus = [w for _, w in le_minus_nw]
+        self.nodes_LP = [n for n, _ in lp_nw]
+        self.w_LP = [w for _, w in lp_nw]
 
         # EE uses same structure as LE (plus/minus for cosmic shear)
         self.theta_EE_plus = self.theta_LE_plus  # Reuse LE plus bins
@@ -749,6 +839,12 @@ class TheoryJAX:
 
         # EP uses LP structure (no plus/minus for cross-correlation)
         self.theta_EP = self.theta_LP  # Reuse LP bins
+
+        # Corresponding bin-average nodes/weights
+        self.nodes_EE_plus, self.w_EE_plus = self.nodes_LE_plus, self.w_LE_plus
+        self.nodes_EE_minus, self.w_EE_minus = self.nodes_LE_minus, self.w_LE_minus
+        self.nodes_PP, self.w_PP = self.nodes_LP, self.w_LP
+        self.nodes_EP, self.w_EP = self.nodes_LP, self.w_LP
 
     def apply_theta_min_cut(self, theta_min_arcmin: Optional[float] = None):
         """
@@ -779,11 +875,31 @@ class TheoryJAX:
             self.theta_cut_report[key] = {'before': len(arr_np), 'after': len(filtered)}
             return jnp.array(filtered)
 
+        def _filter_nodes(nodes, weights, key):
+            mask = self.theta_masks[key]
+            w_np = np.array(weights)
+            n_np = np.array(nodes).reshape(w_np.shape)
+            return jnp.array(n_np[mask].ravel()), jnp.array(w_np[mask])
+
         self.theta_LL_plus = _filter(self.theta_LL_plus, 'LL_plus')
         self.theta_LL_minus = _filter(self.theta_LL_minus, 'LL_minus')
         self.theta_LE_plus = [_filter(arr, f'LE_plus_{i}') for i, arr in enumerate(self.theta_LE_plus)]
         self.theta_LE_minus = [_filter(arr, f'LE_minus_{i}') for i, arr in enumerate(self.theta_LE_minus)]
         self.theta_LP = [_filter(arr, f'LP_{i}') for i, arr in enumerate(self.theta_LP)]
+
+        # Apply the same per-bin masks to the bin-averaging nodes/weights
+        self.nodes_LL_plus, self.w_LL_plus = _filter_nodes(
+            self.nodes_LL_plus, self.w_LL_plus, 'LL_plus')
+        self.nodes_LL_minus, self.w_LL_minus = _filter_nodes(
+            self.nodes_LL_minus, self.w_LL_minus, 'LL_minus')
+        for i in range(len(self.theta_LE_plus)):
+            self.nodes_LE_plus[i], self.w_LE_plus[i] = _filter_nodes(
+                self.nodes_LE_plus[i], self.w_LE_plus[i], f'LE_plus_{i}')
+            self.nodes_LE_minus[i], self.w_LE_minus[i] = _filter_nodes(
+                self.nodes_LE_minus[i], self.w_LE_minus[i], f'LE_minus_{i}')
+        for i in range(len(self.theta_LP)):
+            self.nodes_LP[i], self.w_LP[i] = _filter_nodes(
+                self.nodes_LP[i], self.w_LP[i], f'LP_{i}')
 
         # EE, EP, PP automatically filtered since they reference the same arrays
         # Just update the references after filtering
@@ -791,6 +907,10 @@ class TheoryJAX:
         self.theta_EE_minus = self.theta_LE_minus
         self.theta_PP = self.theta_LP
         self.theta_EP = self.theta_LP
+        self.nodes_EE_plus, self.w_EE_plus = self.nodes_LE_plus, self.w_LE_plus
+        self.nodes_EE_minus, self.w_EE_minus = self.nodes_LE_minus, self.w_LE_minus
+        self.nodes_PP, self.w_PP = self.nodes_LP, self.w_LP
+        self.nodes_EP, self.w_EP = self.nodes_LP, self.w_LP
 
     def predict_data_vector_jax(self, Om, s8, ell_grid=None):
         """
@@ -811,11 +931,16 @@ class TheoryJAX:
 
         predictions_parts = []
 
+        # All entries are annulus averages over the angular bins (the loscov
+        # data vector and covariance are bin-averaged, not point-evaluated).
+
         # LL predictions
         Cl_LL_vals = vmap(lambda ell: self.compute_Cl_LL_jax(Om, s8, ell))(ell_grid)
 
-        xi_LL_plus = self.hankel_j0(Cl_LL_vals, ell_grid, self.theta_LL_plus)
-        xi_LL_minus = self.hankel_j4(Cl_LL_vals, ell_grid, self.theta_LL_minus)
+        xi_LL_plus = self._bin_average(
+            self.hankel_j0(Cl_LL_vals, ell_grid, self.nodes_LL_plus), self.w_LL_plus)
+        xi_LL_minus = self._bin_average(
+            self.hankel_j4(Cl_LL_vals, ell_grid, self.nodes_LL_minus), self.w_LL_minus)
         predictions_parts.append(xi_LL_plus)
         predictions_parts.append(xi_LL_minus)
 
@@ -826,8 +951,12 @@ class TheoryJAX:
         for bin_idx in range(n_e_bins):
             Cl_LE_vals = vmap(lambda ell: self.compute_Cl_LE_jax(Om, s8, ell, bin_idx))(ell_grid)
 
-            xi_LE_plus = self.hankel_j0(Cl_LE_vals, ell_grid, self.theta_LE_plus[bin_idx])
-            xi_LE_minus = self.hankel_j4(Cl_LE_vals, ell_grid, self.theta_LE_minus[bin_idx])
+            xi_LE_plus = self._bin_average(
+                self.hankel_j0(Cl_LE_vals, ell_grid, self.nodes_LE_plus[bin_idx]),
+                self.w_LE_plus[bin_idx])
+            xi_LE_minus = self._bin_average(
+                self.hankel_j4(Cl_LE_vals, ell_grid, self.nodes_LE_minus[bin_idx]),
+                self.w_LE_minus[bin_idx])
             predictions_parts.append(xi_LE_plus)
             predictions_parts.append(xi_LE_minus)
 
@@ -835,15 +964,21 @@ class TheoryJAX:
         for bin_idx in range(n_p_bins):
             Cl_LP_vals = vmap(lambda ell: self.compute_Cl_LP_jax(Om, s8, ell, bin_idx))(ell_grid)
 
-            xi_LP = self.hankel_j2(Cl_LP_vals, ell_grid, self.theta_LP[bin_idx])
+            xi_LP = self._bin_average(
+                self.hankel_j2(Cl_LP_vals, ell_grid, self.nodes_LP[bin_idx]),
+                self.w_LP[bin_idx])
             predictions_parts.append(xi_LP)
 
         # EE predictions (cosmic shear auto-correlation)
         for bin_idx in range(n_e_bins):
             Cl_EE_vals = vmap(lambda ell: self.compute_Cl_EE_jax(Om, s8, ell, bin_idx))(ell_grid)
 
-            xi_EE_plus = self.hankel_j0(Cl_EE_vals, ell_grid, self.theta_EE_plus[bin_idx])
-            xi_EE_minus = self.hankel_j4(Cl_EE_vals, ell_grid, self.theta_EE_minus[bin_idx])
+            xi_EE_plus = self._bin_average(
+                self.hankel_j0(Cl_EE_vals, ell_grid, self.nodes_EE_plus[bin_idx]),
+                self.w_EE_plus[bin_idx])
+            xi_EE_minus = self._bin_average(
+                self.hankel_j4(Cl_EE_vals, ell_grid, self.nodes_EE_minus[bin_idx]),
+                self.w_EE_minus[bin_idx])
             predictions_parts.append(xi_EE_plus)
             predictions_parts.append(xi_EE_minus)
 
@@ -851,7 +986,9 @@ class TheoryJAX:
         for bin_idx in range(min(n_e_bins, n_p_bins)):
             Cl_EP_vals = vmap(lambda ell: self.compute_Cl_EP_jax(Om, s8, ell, bin_idx))(ell_grid)
 
-            xi_EP = self.hankel_j2(Cl_EP_vals, ell_grid, self.theta_EP[bin_idx])
+            xi_EP = self._bin_average(
+                self.hankel_j2(Cl_EP_vals, ell_grid, self.nodes_EP[bin_idx]),
+                self.w_EP[bin_idx])
             predictions_parts.append(xi_EP)
 
         # PP predictions (galaxy clustering auto-correlation)
@@ -860,7 +997,9 @@ class TheoryJAX:
         for bin_idx in range(n_p_bins):
             Cl_PP_vals = vmap(lambda ell: self.compute_Cl_PP_jax(Om, s8, ell, bin_idx))(ell_grid)
 
-            xi_PP = self.hankel_j0(Cl_PP_vals, ell_grid, self.theta_PP[bin_idx])
+            xi_PP = self._bin_average(
+                self.hankel_j0(Cl_PP_vals, ell_grid, self.nodes_PP[bin_idx]),
+                self.w_PP[bin_idx])
             predictions_parts.append(xi_PP)
 
         return jnp.concatenate(predictions_parts)
