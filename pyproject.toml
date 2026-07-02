@@ -22,6 +22,7 @@ dev = [
     "pytest>=7.0",
     "scipy",  # Needed for test comparisons
     "chainconsumer",  # Optional cross-check for the native ellipse plotter
+    "hankel",  # Optional cross-check for the Ogata Hankel transforms (loscov's transform)
 ]
 
 [tool.setuptools.packages.find]
