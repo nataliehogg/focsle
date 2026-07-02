@@ -128,25 +128,29 @@ def parse_dataset_name(dataset_name: str) -> Dict:
         Dictionary with parsed parameters
     """
     params = {}
-    parts = dataset_name.split('_')
+    # '_' both separates parameters and joins words within a key (e.g. Nbin_z,
+    # SNR_goal). Tokens without '=' are prefix words of the next key.
+    pending = []
 
-    for i, part in enumerate(parts):
-        if '=' in part:
-            key, val = part.split('=')
-            # Handle special case of Nbin_z
-            if key == 'Nbin' and i + 1 < len(parts) and parts[i + 1].startswith('z='):
-                key = 'Nbin_z'
-                val = parts[i + 1].split('=')[1]
-            try:
-                # Try to convert to number
-                if 'e' in val.lower():
-                    params[key] = float(val)
-                elif '.' in val:
-                    params[key] = float(val)
-                else:
-                    params[key] = int(val)
-            except ValueError:
-                params[key] = val
+    for part in dataset_name.split('_'):
+        if '=' not in part:
+            pending.append(part)
+            continue
+
+        key_tail, val = part.split('=', 1)
+        key = '_'.join(pending + [key_tail])
+        pending = []
+
+        try:
+            # Try to convert to number
+            if 'e' in val.lower():
+                params[key] = float(val)
+            elif '.' in val:
+                params[key] = float(val)
+            else:
+                params[key] = int(val)
+        except ValueError:
+            params[key] = val
 
     return params
 

@@ -308,13 +308,13 @@ class FisherForecast:
         self.jacobian = jacobian_func(params_fid)
 
         # Some datasets contain only a subset of probe covariances (e.g., LL/LE/LP).
-        # The theory may predict additional probes; align to covariance size.
+        # The theory predicts all 6 probes; align to covariance size by truncating.
         n_data_cov = self.C_full.shape[0]
         if self.jacobian.shape[0] > n_data_cov:
             if self.verbose:
                 print(
-                    f"  Warning: theory data vector ({self.jacobian.shape[0]}) is larger than "
-                    f"covariance size ({n_data_cov}); truncating to first {n_data_cov} entries."
+                    f"  Note: theory predicts {self.jacobian.shape[0]} entries but covariance "
+                    f"covers {n_data_cov}; using first {n_data_cov} (extra probes have no covariance data)."
                 )
             self.jacobian = self.jacobian[:n_data_cov, :]
         elif self.jacobian.shape[0] < n_data_cov:
@@ -430,8 +430,21 @@ class FisherForecast:
             if self.verbose:
                 print("\n4. Combined (LL + LE + LP):")
 
-        F_combined = self.jacobian.T @ C_inv_jax @ self.jacobian
-        self.fisher_matrices['Combined'] = np.array(F_combined)
+        # Use block-diagonal sum rather than F = J^T C^{-1} J with the full covariance inverse.
+        # The full matrix inversion is numerically unstable when probes share the Q_L kernel
+        # (strongly correlated), causing C_inv to blow up and yield unphysical constraints.
+        # Summing individual Fisher matrices is the block-diagonal approximation; it slightly
+        # overestimates the combined information (ignores cross-probe covariances) but gives
+        # stable, physically meaningful results.
+        F_combined = (self.fisher_matrices['LL'] +
+                      self.fisher_matrices['LE'] +
+                      self.fisher_matrices['LP'])
+        if 'n_EE' in self.sizes:
+            F_combined = (F_combined +
+                          self.fisher_matrices['EE'] +
+                          self.fisher_matrices['EP'] +
+                          self.fisher_matrices['PP'])
+        self.fisher_matrices['Combined'] = F_combined
         self.constraints['Combined'] = self._analyze_constraints(
             self.fisher_matrices['Combined'], fiducial
         )

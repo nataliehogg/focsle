@@ -13,7 +13,7 @@ from pathlib import Path
 
 from matplotlib import rc
 rc('text', usetex=True)
-rc('font', family='serif')
+rc('font', family='serif', size=20)
 
 def plot_fisher_ellipse(
     F: np.ndarray,
@@ -127,7 +127,7 @@ def plot_constraints(
     # Set up figure
     n_plots = len(probes)
     if figsize is None:
-        figsize = (6 * n_plots, 5)
+        figsize = (4 * n_plots, 4)
 
     fig, axes = plt.subplots(1, n_plots, figsize=figsize)
     if n_plots == 1:
@@ -156,17 +156,17 @@ def plot_constraints(
         ax.plot(fiducial[0], fiducial[1], 'k+', markersize=10, markeredgewidth=2)
 
         # Labels
-        ax.set_xlabel(r'$\Omega_{\rm m}$', fontsize=14)
-        ax.set_ylabel(r'$\sigma_8$', fontsize=14)
-        ax.set_title(f'{probe}: {probe_titles.get(probe, probe)}', fontsize=13)
-        ax.legend(loc='best', fontsize=11)
+        ax.set_xlabel(r'$\Omega_{\rm m}$',) #fontsize=14)
+        ax.set_ylabel(r'$\sigma_8$', )#fontsize=14)
+        ax.set_title(f'{probe}',)# fontsize=13)
+        ax.legend(loc='best')#, fontsize=11)
         ax.grid(False)
 
         # Auto-scale axes
         ax.autoscale()
 
     if title:
-        fig.suptitle(title, fontsize=14, y=1.02)
+        fig.suptitle(title)#, fontsize=14, y=1.02)
 
     plt.tight_layout()
 
@@ -220,7 +220,7 @@ def plot_constraints_overlay(
 
     if ax is None:
         if figsize is None:
-            figsize = (6, 5)
+            figsize = (6,6)
         fig, ax = plt.subplots(figsize=figsize)
     else:
         fig = ax.figure
@@ -238,11 +238,11 @@ def plot_constraints_overlay(
         )
 
     ax.plot(fiducial[0], fiducial[1], 'k+', markersize=10, markeredgewidth=2)
-    ax.set_xlabel(r'$\Omega_{\rm m}$', fontsize=14)
-    ax.set_ylabel(r'$\sigma_8$', fontsize=14)
+    ax.set_xlabel(r'$\Omega_{\rm m}$')
+    ax.set_ylabel(r'$\sigma_8$')
     if title:
-        ax.set_title(title, fontsize=13)
-    ax.legend(loc='best', fontsize=11)
+        ax.set_title(title)
+    ax.legend(loc='best')
     ax.grid(False)
     ax.autoscale()
 
@@ -261,6 +261,7 @@ def plot_comparison(
     colors: List[str] = None,
     output_file: Optional[str] = None,
     title: Optional[str] = None,
+    show_fiducial: bool = True,
 ) -> plt.Figure:
     """
     Compare Fisher constraints from multiple datasets.
@@ -273,6 +274,7 @@ def plot_comparison(
         colors: List of colors for each dataset
         output_file: If provided, save figure to this path
         title: Optional figure title
+        show_fiducial: If True, mark the fiducial point on each panel
 
     Returns:
         Matplotlib figure
@@ -316,18 +318,18 @@ def plot_comparison(
                 alpha_2sig=0.15 - 0.03 * i,
             )
 
-        # Mark fiducial
-        ax.plot(fiducial[0], fiducial[1], 'k+', markersize=10, markeredgewidth=2)
+        if show_fiducial:
+            ax.plot(fiducial[0], fiducial[1], 'k+', markersize=10, markeredgewidth=2)
 
-        ax.set_xlabel(r'$\Omega_{\rm m}$', fontsize=14)
+        ax.set_xlabel(r'$\Omega_{\rm m}$')#, fontsize=14)
         if ax == axes[0]:
-            ax.set_ylabel(r'$\sigma_8$', fontsize=14)
-        ax.set_title(f'{probe}: {probe_titles.get(probe, probe)}', fontsize=13)
+            ax.set_ylabel(r'$\sigma_8$')#, fontsize=14)
+        ax.set_title(f'{probe}')#, fontsize=13)
         ax.grid(False)
         ax.autoscale()
 
     if title:
-        fig.suptitle(title, fontsize=14, y=1.02)
+        fig.suptitle(title)#, fontsize=14, y=1.02)
 
     # Single legend outside axes (collect unique handles/labels from all axes)
     handles = []
@@ -433,9 +435,9 @@ def plot_fom_comparison(
         offset = (i - len(results_list) / 2 + 0.5) * width
         bars = ax.bar(x + offset, foms, width, label=label)
 
-    ax.set_xlabel('Probe', fontsize=12)
-    ax.set_ylabel('Figure of Merit', fontsize=12)
-    ax.set_title('Figure of Merit Comparison', fontsize=14)
+    ax.set_xlabel('Probe')
+    ax.set_ylabel('Figure of Merit')
+    ax.set_title('Figure of Merit Comparison')
     ax.set_xticks(x)
     ax.set_xticklabels(probes)
     ax.legend()
@@ -506,10 +508,10 @@ def plot_all_combinations(
         )
 
     ax.plot(fiducial[0], fiducial[1], 'k+', markersize=12, markeredgewidth=2)
-    ax.set_xlabel(r'$\Omega_{\rm m}$', fontsize=14)
-    ax.set_ylabel(r'$\sigma_8$', fontsize=14)
-    ax.set_title('Fisher Constraints: Various Probe Combinations', fontsize=14)
-    ax.legend(loc='best', fontsize=10)
+    ax.set_xlabel(r'$\Omega_{\rm m}$')
+    ax.set_ylabel(r'$\sigma_8$')
+    ax.set_title('Fisher Constraints: Various Probe Combinations')
+    ax.legend(loc='best')
     ax.grid(False)
     ax.autoscale()
 

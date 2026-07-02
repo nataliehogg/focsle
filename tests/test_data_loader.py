@@ -32,6 +32,24 @@ def test_parse_dataset_name():
     assert params2['Nlens'] == 1e4
     assert params2['sigL'] == 0.1
 
+    # Test underscore-containing keys (Nbin_z, SNR_goal, Nbin_max) on a full
+    # realistic name -- regression test for the split('_') key-mangling bug
+    name3 = "Nlens=1e5_sigL=0.2_Nbin_z=6_SNR_goal=8_Nbin_max=20_nsamp=1e6"
+    params3 = parse_dataset_name(name3)
+
+    assert params3 == {
+        'Nlens': 1e5,
+        'sigL': 0.2,
+        'Nbin_z': 6,
+        'SNR_goal': 8,
+        'Nbin_max': 20,
+        'nsamp': 1e6,
+    }
+    # Mangled keys from the old parser must not appear
+    assert 'z' not in params3
+    assert 'goal' not in params3
+    assert 'max' not in params3
+
 
 def test_build_full_covariance():
     """Test full covariance matrix construction from blocks."""
