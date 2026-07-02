@@ -791,6 +791,41 @@ class TheoryJAX:
         """Hankel transform with J4 Bessel function (Ogata quadrature)."""
         return self._hankel_ogata(Cl_func_values, ell_grid, theta, *self._ogata[4])
 
+    @staticmethod
+    def _bin_average_nodes(ad_obj, n_nodes: int = 16):
+        """
+        Gauss-Legendre nodes and weights for annulus-averaged correlations.
+
+        loscov's binned data (and covariance) are bin averages
+        xi_bin = int 2*pi*theta xi(theta) dtheta / Omega_bin, not point
+        evaluations at the representative Thetas. Returns (nodes, weights)
+        with nodes flat (nbin*n_nodes,) and weights (nbin, n_nodes) summing
+        to 1 per bin, so xi_bin = sum_i w_i xi(node_i) is the exact average.
+
+        Falls back to point evaluation at .Thetas if the pickled object has
+        no bin limits.
+        """
+        if not hasattr(ad_obj, 'limits'):
+            # Point evaluation at the representative angles (1 node per bin)
+            thetas = np.asarray(ad_obj.Thetas, dtype=float)
+            return jnp.array(thetas), jnp.ones((len(thetas), 1))
+
+        limits = np.asarray(ad_obj.limits, dtype=float)
+        x, w = np.polynomial.legendre.leggauss(n_nodes)
+        lo = limits[:-1, None]
+        hi = limits[1:, None]
+        mid = 0.5 * (hi + lo)
+        half = 0.5 * (hi - lo)
+        nodes = mid + half * x[None, :]           # (nbin, n_nodes)
+        wts = half * w[None, :] * 2.0 * np.pi * nodes
+        wts = wts / wts.sum(axis=1, keepdims=True)  # exact annulus average
+        return jnp.array(nodes.ravel()), jnp.array(wts)
+
+    @staticmethod
+    def _bin_average(xi_nodes, weights):
+        """Reduce node evaluations (nbin*n_nodes,) to per-bin averages (nbin,)."""
+        return (weights * xi_nodes.reshape(weights.shape)).sum(axis=1)
+
     def load_angular_bins(self, data_dir: str):
         """
         Load angular bin information.
