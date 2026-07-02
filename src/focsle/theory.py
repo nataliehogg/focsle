@@ -814,10 +814,12 @@ class TheoryJAX:
             predictions_parts.append(xi_EP)
 
         # PP predictions (galaxy clustering auto-correlation)
+        # w(theta) is scalar x scalar, so the Hankel transform uses J0
+        # (unlike LP/EP, which are spin-2 x scalar and use J2)
         for bin_idx in range(n_p_bins):
             Cl_PP_vals = vmap(lambda ell: self.compute_Cl_PP_jax(Om, s8, ell, bin_idx))(ell_grid)
 
-            xi_PP = self.hankel_j2(Cl_PP_vals, ell_grid, self.theta_PP[bin_idx])
+            xi_PP = self.hankel_j0(Cl_PP_vals, ell_grid, self.theta_PP[bin_idx])
             predictions_parts.append(xi_PP)
 
         return jnp.concatenate(predictions_parts)
