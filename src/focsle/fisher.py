@@ -473,7 +473,12 @@ class FisherForecast:
             Dictionary with Fisher matrix and constraints for the combination
         """
         if not self._is_setup:
-            raise RuntimeError("Must call setup() and compute_fisher() first")
+            raise RuntimeError("Must call setup() before compute_custom_fisher()")
+        if self.jacobian is None:
+            raise RuntimeError(
+                "Jacobian not available - call compute_fisher() once before "
+                "compute_custom_fisher() (it computes and caches the Jacobian)."
+            )
 
         # Build index mask for selected probes
         probe_indices = []
