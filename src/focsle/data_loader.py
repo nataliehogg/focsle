@@ -204,6 +204,175 @@ def detect_nbins(data_dir: str) -> int:
     raise ValueError(f"Could not detect number of bins from {data_dir}")
 
 
+# =============================================================================
+# New-format (6-probe) datasets
+# =============================================================================
+#
+# Newer loscov runs (which_correlations='all') save every file with FOUR bin
+# indices: ccov_{b1}_{b2}_{b3}_{b4} is the covariance between the section for
+# bin pair (b1, b2) of the row probe and (b3, b4) of the column probe. The
+# data vector has one section per valid bin pair of each probe (see
+# get_probe_sections), each section internally ordered [xi_minus, xi_plus]
+# for probes with plus/minus components. Within-probe folders (e.g. EEEE)
+# only store the upper triangle in section-enumeration order; the mirror
+# block is the transpose. Files are HDF5 (data_format='hdf5') or pickle.
+
+PROBE_ORDER = ['LL', 'LE', 'LP', 'EE', 'EP', 'PP']
+
+
+def get_probe_sections(probe: str, nbins_L: int, nbins_E: int,
+                       nbins_P: int) -> List[Tuple[int, int]]:
+    """
+    Valid (zbin1, zbin2) pairs for one probe, in loscov's canonical order.
+
+    Mirrors loscov's get_valid_pairs (functions/useful_functions.py): auto
+    probes store the lower triangle z1 >= z2 (PP: diagonal only, cross-bin
+    clustering is not simulated), cross probes the full rectangle. For EP the
+    first index is the E (shear) bin and the second the P (position) bin;
+    only z1 >= z2 pairs carry signal (source behind lens) and are saved.
+    """
+    if probe == 'LL':
+        return [(z1, z2) for z1 in range(nbins_L) for z2 in range(z1 + 1)]
+    if probe == 'EE':
+        return [(z1, z2) for z1 in range(nbins_E) for z2 in range(z1 + 1)]
+    if probe == 'PP':
+        return [(z1, z1) for z1 in range(nbins_P)]
+    if probe == 'LE':
+        return [(z1, z2) for z1 in range(nbins_L) for z2 in range(nbins_E)]
+    if probe == 'LP':
+        return [(z1, z2) for z1 in range(nbins_L) for z2 in range(nbins_P)]
+    if probe == 'EP':
+        return [(z1, z2) for z1 in range(nbins_E) for z2 in range(z1 + 1)]
+    raise ValueError(f"Unknown probe: {probe}")
+
+
+def is_new_format(data_dir: str) -> bool:
+    """True if the dataset uses the new 4-index (6-probe capable) layout."""
+    return (Path(data_dir) / 'covariance' / 'LLLL' / 'ccov_0_0_0_0').exists()
+
+
+def _load_matrix_file(path: Path) -> np.ndarray:
+    """Load one covariance matrix file, HDF5 or pickle (detected by magic)."""
+    with open(path, 'rb') as f:
+        magic = f.read(8)
+    if magic.startswith(b'\x89HDF'):
+        import h5py
+        with h5py.File(path, 'r') as f:
+            if 'data' in f:
+                return np.asarray(f['data'][()])
+            raise ValueError(f"Unrecognised HDF5 layout in {path}: keys={list(f.keys())}")
+    with open(path, 'rb') as f:
+        return pickle.load(f)
+
+
+def _load_summed_block(cov_type_dir: Path, s1: Tuple[int, int],
+                       s2: Tuple[int, int]) -> np.ndarray:
+    """Load ccov+ncov+scov for one section pair of a new-format block."""
+    total = None
+    for kind in ('ccov', 'ncov', 'scov'):
+        path = cov_type_dir / f'{kind}_{s1[0]}_{s1[1]}_{s2[0]}_{s2[1]}'
+        if not path.exists():
+            raise FileNotFoundError(
+                f"Missing covariance file '{path.name}' in {cov_type_dir} "
+                f"(sections {s1} x {s2}) - was the covariance generation "
+                f"interrupted?"
+            )
+        m = _load_matrix_file(path)
+        total = m if total is None else total + m
+    return total
+
+
+def load_covariance_full(data_dir: str, nbins_E: int, nbins_P: int,
+                         nbins_L: int = 1, verbose: bool = True
+                         ) -> Tuple[np.ndarray, Dict[str, int], Dict]:
+    """
+    Load and assemble the full covariance of a new-format dataset.
+
+    Args:
+        data_dir: Path to dataset directory
+        nbins_E, nbins_P, nbins_L: Tomographic bin counts per population
+        verbose: Print progress messages
+
+    Returns:
+        (C_full, sizes, layout) where sizes maps 'n_LL' etc. to per-probe
+        totals, and layout maps each probe to
+        {'pairs': [(z1, z2), ...], 'section_sizes': [...], 'start': int}.
+        Section sizes are read from the diagonal covariance blocks - the
+        SNR-optimised binning gives every section its own angular bin count.
+    """
+    cov_dir = Path(data_dir) / 'covariance'
+
+    probes = [p for p in PROBE_ORDER if (cov_dir / (p + p)).exists()]
+    if not probes:
+        raise FileNotFoundError(f"No within-probe covariance folders in {cov_dir}")
+
+    # Enumerate sections and read their sizes from the diagonal blocks
+    layout = {}
+    offset = 0
+    for probe in probes:
+        pairs = get_probe_sections(probe, nbins_L, nbins_E, nbins_P)
+        section_sizes = []
+        for s in pairs:
+            block = _load_summed_block(cov_dir / (probe + probe), s, s)
+            section_sizes.append(block.shape[0])
+        layout[probe] = {'pairs': pairs, 'section_sizes': section_sizes,
+                         'start': offset}
+        offset += sum(section_sizes)
+        if verbose:
+            print(f"  {probe}: {len(pairs)} sections, {sum(section_sizes)} entries")
+
+    n_total = offset
+    C = np.zeros((n_total, n_total))
+
+    def section_offsets(probe):
+        off = layout[probe]['start']
+        offs = []
+        for size in layout[probe]['section_sizes']:
+            offs.append(off)
+            off += size
+        return offs
+
+    offsets = {p: section_offsets(p) for p in probes}
+
+    # Fill all blocks
+    for i, p1 in enumerate(probes):
+        for p2 in probes[i:]:
+            folder = cov_dir / (p1 + p2)
+            pairs1 = layout[p1]['pairs']
+            pairs2 = layout[p2]['pairs']
+            if not folder.exists():
+                warnings_msg = (
+                    f"Covariance folder {p1 + p2} not found in {cov_dir}; "
+                    f"treating the {p1}x{p2} cross-covariance as zero."
+                )
+                import warnings
+                warnings.warn(warnings_msg, RuntimeWarning)
+                continue
+            if verbose:
+                print(f"  Loading {p1 + p2}...")
+            for a, s1 in enumerate(pairs1):
+                for b, s2 in enumerate(pairs2):
+                    if p1 == p2 and a > b:
+                        continue  # stored as the transpose of (b, a)
+                    block = _load_summed_block(folder, s1, s2)
+                    r = offsets[p1][a]
+                    c = offsets[p2][b]
+                    h = layout[p1]['section_sizes'][a]
+                    w = layout[p2]['section_sizes'][b]
+                    if block.shape != (h, w):
+                        raise ValueError(
+                            f"{p1 + p2} block {s1}x{s2} has shape {block.shape}, "
+                            f"expected ({h}, {w}) from the diagonal blocks."
+                        )
+                    C[r:r + h, c:c + w] = block
+                    if (p1, a) != (p2, b):
+                        C[c:c + w, r:r + h] = block.T
+
+    sizes = {f'n_{p}': sum(layout[p]['section_sizes']) for p in probes}
+
+    return C, sizes, layout
+
+
 def load_covariance_block(cov_type_dir: str, nbins: int) -> np.ndarray:
     """
     Load covariance block, handling both single-file and bin-by-bin structures.

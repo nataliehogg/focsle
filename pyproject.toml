@@ -13,6 +13,7 @@ dependencies = [
     "jaxlib",
     "camb",
     "matplotlib",
+    "h5py",  # New-format loscov datasets store covariance blocks as HDF5
 ]
 
 [project.optional-dependencies]

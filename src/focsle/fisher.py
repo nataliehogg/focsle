@@ -21,8 +21,10 @@ from jax import jacfwd
 from .theory import TheoryJAX
 from .data_loader import (
     load_covariance,
+    load_covariance_full,
     build_full_covariance,
     detect_nbins,
+    is_new_format,
     list_available_datasets,
     parse_dataset_name,
 )
@@ -90,6 +92,7 @@ class FisherForecast:
         self.constraints = {}
         self.jacobian = None
         self.cov_blocks = None
+        self.layout = None
         self.C_full = None
         self.C_inv = None
         self.C_LL_inv = None
@@ -169,19 +172,34 @@ class FisherForecast:
                 if rep['before'] != rep['after']:
                     print(f"  {key}: {rep['before']} -> {rep['after']} angles")
 
-        # Load covariance matrices
+        # Load covariance matrices. Two on-disk formats exist:
+        # - old (3-probe): 2-index pickle files, assembled from 6/12 blocks
+        # - new (6-probe): 4-index HDF5/pickle files, one section per bin
+        #   pair, assembled directly into the full matrix
         if self.verbose:
             print("\nLoading covariance matrices...")
-        self.cov_blocks = load_covariance(
-            str(self.data_dir), nbins=self.nbins, verbose=self.verbose
-        )
-        if theta_min_arcmin is not None:
-            self._apply_theta_scale_cut()
+        if is_new_format(self.data_dir):
+            self.cov_blocks = None
+            self.C_full, self.sizes, self.layout = load_covariance_full(
+                str(self.data_dir),
+                nbins_E=self.theory.Nbinz_E,
+                nbins_P=self.theory.Nbinz_P,
+                verbose=self.verbose,
+            )
+            if theta_min_arcmin is not None:
+                self._apply_theta_scale_cut_new()
+        else:
+            self.layout = None
+            self.cov_blocks = load_covariance(
+                str(self.data_dir), nbins=self.nbins, verbose=self.verbose
+            )
+            if theta_min_arcmin is not None:
+                self._apply_theta_scale_cut()
 
-        # Build full covariance
-        if self.verbose:
-            print("Building full covariance matrix...")
-        self.C_full, self.sizes = build_full_covariance(self.cov_blocks)
+            # Build full covariance
+            if self.verbose:
+                print("Building full covariance matrix...")
+            self.C_full, self.sizes = build_full_covariance(self.cov_blocks)
         if self.verbose:
             print(f"  Shape: {self.C_full.shape}")
             size_str = f"  Data vector sizes: n_LL={self.sizes['n_LL']}, " \
@@ -314,20 +332,28 @@ class FisherForecast:
         jacobian_func = jacfwd(data_vec_func)
         self.jacobian = jacobian_func(params_fid)
 
-        # Some datasets contain only a subset of probe covariances (e.g., LL/LE/LP).
-        # The theory predicts all 6 probes; align to covariance size by truncating.
-        n_data_cov = self.C_full.shape[0]
-        if self.jacobian.shape[0] > n_data_cov:
-            if self.verbose:
-                print(
-                    f"  Note: theory predicts {self.jacobian.shape[0]} entries but covariance "
-                    f"covers {n_data_cov}; using first {n_data_cov} (extra probes have no covariance data)."
-                )
-            self.jacobian = self.jacobian[:n_data_cov, :]
-        elif self.jacobian.shape[0] < n_data_cov:
+        # Verify theory/covariance alignment probe by probe before contracting.
+        # A total-length match is not enough: if any one probe section were
+        # mis-sized, every later probe would be silently shifted against the
+        # covariance (audit B6).
+        pred_sizes = self.theory.prediction_sizes()
+        cov_probes = [k[2:] for k in self.sizes.keys()]  # 'n_LL' -> 'LL'
+        if set(pred_sizes.keys()) != set(cov_probes):
             raise ValueError(
-                f"Theory data vector ({self.jacobian.shape[0]}) is shorter than covariance size "
-                f"({n_data_cov}); cannot compute Fisher matrix."
+                f"Probe mismatch between theory predictions ({sorted(pred_sizes)}) "
+                f"and covariance blocks ({sorted(cov_probes)})."
+            )
+        for probe in cov_probes:
+            if pred_sizes[probe] != self.sizes[f'n_{probe}']:
+                raise ValueError(
+                    f"{probe} data-vector size mismatch: theory predicts "
+                    f"{pred_sizes[probe]} entries but the covariance has "
+                    f"{self.sizes[f'n_{probe}']}."
+                )
+        if self.jacobian.shape[0] != self.C_full.shape[0]:
+            raise ValueError(
+                f"Jacobian length {self.jacobian.shape[0]} does not match "
+                f"covariance size {self.C_full.shape[0]}."
             )
 
         if self.verbose:
@@ -639,15 +665,15 @@ class FisherForecast:
                     offset += 1
             return np.array(idx, dtype=int)
 
-        # LL indices
-        ll_masks = [masks['LL_plus'], masks['LL_minus']]
+        # LL indices (minus first: loscov covariance blocks are [mm, mp; pm, pp])
+        ll_masks = [masks['LL_minus'], masks['LL_plus']]
         idx_LL = build_indices(ll_masks)
 
-        # LE indices (per bin: plus then minus)
+        # LE indices (per bin: minus then plus, matching the covariance layout)
         le_mask_list = []
         for i in range(len(self.theory.theta_LE_plus)):
-            le_mask_list.append(masks[f'LE_plus_{i}'])
             le_mask_list.append(masks[f'LE_minus_{i}'])
+            le_mask_list.append(masks[f'LE_plus_{i}'])
         idx_LE = build_indices(le_mask_list)
 
         # LP indices (per bin)
@@ -680,6 +706,59 @@ class FisherForecast:
             self.cov_blocks['EEEP'] = slice_block(self.cov_blocks['EEEP'], idx_EE, idx_EP)
             self.cov_blocks['EEPP'] = slice_block(self.cov_blocks['EEPP'], idx_EE, idx_PP)
             self.cov_blocks['EPPP'] = slice_block(self.cov_blocks['EPPP'], idx_EP, idx_PP)
+
+    def _apply_theta_scale_cut_new(self):
+        """
+        Apply the theta_min cut to a new-format full covariance.
+
+        Walks the covariance layout in data-vector order, concatenating the
+        per-section theory masks (minus first within plus/minus sections,
+        matching the covariance block convention). Each section's pre-cut
+        mask length is checked against the covariance section size, so any
+        theory/covariance misalignment fails loudly here instead of silently
+        weighting the wrong entries.
+        """
+        masks = self.theory.theta_masks
+
+        def section_mask_keys(probe, pair):
+            if probe == 'LL':
+                return ['LL_minus', 'LL_plus']
+            if probe == 'LE':
+                return [f'LE_minus_{pair[1]}', f'LE_plus_{pair[1]}']
+            if probe == 'LP':
+                return [f'LP_{pair[1]}']
+            if probe == 'EE':
+                return [f'EE_minus_{pair[0]}_{pair[1]}', f'EE_plus_{pair[0]}_{pair[1]}']
+            if probe == 'EP':
+                return [f'EP_{pair[0]}_{pair[1]}']
+            if probe == 'PP':
+                return [f'PP_{pair[0]}']
+            raise ValueError(f"Unknown probe: {probe}")
+
+        keep_parts = []
+        for probe, info in self.layout.items():
+            for k, pair in enumerate(info['pairs']):
+                mask = np.concatenate(
+                    [np.asarray(masks[key]) for key in section_mask_keys(probe, pair)])
+                expected = info['section_sizes'][k]
+                if len(mask) != expected:
+                    raise ValueError(
+                        f"{probe} section {pair}: theory has {len(mask)} angular "
+                        f"bins but the covariance section has {expected}."
+                    )
+                keep_parts.append(mask)
+                info['section_sizes'][k] = int(mask.sum())
+
+        keep = np.concatenate(keep_parts)
+        idx = np.flatnonzero(keep)
+        self.C_full = self.C_full[np.ix_(idx, idx)]
+
+        # Rebuild per-probe offsets/totals after the cut
+        offset = 0
+        for probe, info in self.layout.items():
+            info['start'] = offset
+            offset += sum(info['section_sizes'])
+            self.sizes[f'n_{probe}'] = sum(info['section_sizes'])
 
     def _analyze_constraints(self, F: np.ndarray, fiducial: List[float]) -> Optional[Dict]:
         """Extract parameter constraints from Fisher matrix."""
