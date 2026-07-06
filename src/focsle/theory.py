@@ -60,7 +60,11 @@ CHI_MAX_QL_GRID = 10000.0  # Larger range for Q_L kernel grid
 # ripples in D(Omega_m) made dD/dOm noisy at the tens-of-percent level for LP.
 N_CHI_CL = 400   # Points for C_ell integrals over comoving distance
 N_CHI_QL = 200   # Points for Q_L kernel pre-computation (higher accuracy needed)
-N_Z_KERNEL = 256  # Points for redshift-bin averaging in Q_E/Q_P precomputation
+# N_Z_KERNEL: the hard-edged tomographic p(z) is sampled on a single global
+# z grid; at 256 points a narrow P bin gets ~12 samples and the resulting
+# per-bin normalisation error shifts LP/EP/PP amplitudes by several percent
+# (verified against loscov data 2026-07-06). 4096 brings this below 1%.
+N_Z_KERNEL = 4096  # Points for redshift-bin averaging in Q_E/Q_P precomputation
 
 # Angular multipole defaults: grid on which C_ell is computed and then
 # log-log interpolated (power-law tails) inside the Ogata Hankel transforms.
@@ -97,7 +101,11 @@ class TheoryJAX:
                  cosmo_fid: Optional[Dict] = None):
         self.c_km_s = 299792.458  # km/s
 
-        # Fiducial cosmology (can be overridden)
+        # Fiducial cosmology (can be overridden). Defaults match the loscov
+        # simulations exactly: loscov's config never sets A_s, so its data
+        # were generated with CAMB's default A_s = 2e-9 (and ns = 0.965);
+        # using any other fiducial here puts a uniform amplitude offset
+        # between theory and the simulated data vectors (audit A7/D3).
         if cosmo_fid is None:
             self.cosmo_fid = {
                 'H0': 67.37,
@@ -106,8 +114,8 @@ class TheoryJAX:
                 'mnu': 0.06,
                 'omk': 0.0,
                 'tau': 0.054,
-                'As': 2.1e-9,
-                'ns': 0.9649
+                'As': 2.0e-9,
+                'ns': 0.965
             }
         else:
             self.cosmo_fid = cosmo_fid.copy()
@@ -119,7 +127,10 @@ class TheoryJAX:
                 (self.cosmo_fid['H0'] / 100) ** 2
             )
         if 'sigma8' not in self.cosmo_fid:
-            self.cosmo_fid['sigma8'] = 0.8111  # Planck 2018 TT,TE,EE+lowE+lensing
+            # sigma8 produced by CAMB for the default parameters above
+            # (A_s = 2e-9): the Fisher fiducial must sit where the sims sit.
+            # (Planck 2018 A_s = 2.1e-9 would give 0.8111.)
+            self.cosmo_fid['sigma8'] = 0.7913
 
         # Setup lens distribution
         self.lens_file = lens_file
@@ -636,39 +647,44 @@ class TheoryJAX:
         return Cl
 
     @partial(jit, static_argnums=(0,))
-    def compute_Cl_EE_jax(self, Om, s8, ell, bin_idx, chi_min=CHI_MIN_DEFAULT,
+    def compute_Cl_EE_jax(self, Om, s8, ell, bin_i, bin_j, chi_min=CHI_MIN_DEFAULT,
                           chi_max=CHI_MAX_DEFAULT, nchi=N_CHI_CL):
         """
-        Compute C_ell^EE - cosmic shear auto-correlation.
+        Compute C_ell^EE - cosmic shear correlation between E bins i and j.
 
-        Uses distribution-averaged Q_E × Q_E kernels.
+        Uses distribution-averaged Q_E(i) × Q_E(j) kernels; the standard
+        cosmic-shear data vector contains all bin pairs i >= j, not just
+        the auto-bin spectra.
         """
         chi_grid = jnp.linspace(chi_min, chi_max, nchi)
         z_grid = self.z_of_chi(Om, chi_grid)
         k_grid = (ell + 0.5) / chi_grid
 
-        QE = self.QE_mean(Om, chi_grid, bin_idx)
+        QE_i = self.QE_mean(Om, chi_grid, bin_i)
+        QE_j = self.QE_mean(Om, chi_grid, bin_j)
         Pk = vmap(lambda z, k: self.Pk_interp(Om, s8, z, k))(z_grid, k_grid)
 
-        integrand = QE * QE * Pk
+        integrand = QE_i * QE_j * Pk
         Cl = jnp.trapezoid(integrand, chi_grid)
 
         return Cl
 
     @partial(jit, static_argnums=(0,))
-    def compute_Cl_EP_jax(self, Om, s8, ell, bin_idx, chi_min=CHI_MIN_DEFAULT,
+    def compute_Cl_EP_jax(self, Om, s8, ell, bin_e, bin_p, chi_min=CHI_MIN_DEFAULT,
                           chi_max=CHI_MAX_DEFAULT, nchi=N_CHI_CL):
         """
-        Compute C_ell^EP - cosmic shear × position cross-correlation.
+        Compute C_ell^EP - shear (E bin) × position (P bin) cross-correlation.
 
-        Uses distribution-averaged Q_E and Q_P kernels.
+        Uses distribution-averaged Q_E(bin_e) and Q_P(bin_p) kernels. Only
+        bin_e >= bin_p pairs carry signal (source behind lens); the loscov
+        data vector stores exactly those.
         """
         chi_grid = jnp.linspace(chi_min, chi_max, nchi)
         z_grid = self.z_of_chi(Om, chi_grid)
         k_grid = (ell + 0.5) / chi_grid
 
-        QE = self.QE_mean(Om, chi_grid, bin_idx)
-        QP = self.QP_mean(Om, chi_grid, bin_idx)
+        QE = self.QE_mean(Om, chi_grid, bin_e)
+        QP = self.QP_mean(Om, chi_grid, bin_p)
         Pk = vmap(lambda z, k: self.Pk_interp(Om, s8, z, k))(z_grid, k_grid)
         Cl = jnp.trapezoid(QE * QP * Pk, chi_grid)
 
@@ -830,6 +846,20 @@ class TheoryJAX:
         """
         Load angular bin information.
 
+        Handles both dataset formats:
+        - old (3-probe): flat Angular_Distributions for LL, per-bin lists for
+          LE/LP; no EE/EP/PP angular info exists, so those probes are not
+          predicted.
+        - new (6-probe, which_correlations='all'): everything is a nested
+          list; LL is [1][1], LE/LP are [1][nbins], and EE/EP/PP are lower-
+          triangular [i][j] (j <= i) with per-pair SNR-optimised binning.
+          For EP the first index is the E (shear) bin, the second the P
+          (position) bin. PP only has diagonal entries.
+
+        Sets self.probes to the probes this dataset actually provides, and
+        for the new format self.ee_pairs / self.ep_pairs / self.pp_bins in
+        loscov's canonical enumeration order (matching the covariance).
+
         Args:
             data_dir: Path to dataset directory
         """
@@ -839,25 +869,43 @@ class TheoryJAX:
         with open(ang_file, 'rb') as f:
             ang_dist = pickle.load(f)
 
+        new_format = isinstance(ang_dist['LL_plus'], list)
+
+        def _nw(ad_obj):
+            return self._bin_average_nodes(ad_obj)
+
+        if new_format:
+            ll_plus = ang_dist['LL_plus'][0][0]
+            ll_minus = ang_dist['LL_minus'][0][0]
+            le_plus_list = ang_dist['LE_plus'][0]
+            le_minus_list = ang_dist['LE_minus'][0]
+            lp_list = ang_dist['LP'][0]
+        else:
+            ll_plus = ang_dist['LL_plus']
+            ll_minus = ang_dist['LL_minus']
+            le_plus_list = ang_dist['LE_plus']
+            le_minus_list = ang_dist['LE_minus']
+            lp_list = ang_dist['LP']
+
         # Representative angles (bin centroids) - kept for scale cuts/reporting
-        self.theta_LL_plus = jnp.array(ang_dist['LL_plus'].Thetas)
-        self.theta_LL_minus = jnp.array(ang_dist['LL_minus'].Thetas)
+        self.theta_LL_plus = jnp.array(ll_plus.Thetas)
+        self.theta_LL_minus = jnp.array(ll_minus.Thetas)
 
         # Bin-averaging nodes/weights (the data vector is annulus-averaged)
-        self.nodes_LL_plus, self.w_LL_plus = self._bin_average_nodes(ang_dist['LL_plus'])
-        self.nodes_LL_minus, self.w_LL_minus = self._bin_average_nodes(ang_dist['LL_minus'])
+        self.nodes_LL_plus, self.w_LL_plus = _nw(ll_plus)
+        self.nodes_LL_minus, self.w_LL_minus = _nw(ll_minus)
 
         # Dynamically detect number of tomographic bins for E/P probes.
-        self.n_tomo_bins_E = len(ang_dist['LE_plus'])
-        self.n_tomo_bins_P = len(ang_dist['LP'])
+        self.n_tomo_bins_E = len(le_plus_list)
+        self.n_tomo_bins_P = len(lp_list)
         self.n_tomo_bins = self.n_tomo_bins_E
-        self.theta_LE_plus = [jnp.array(ang_dist['LE_plus'][i].Thetas) for i in range(self.n_tomo_bins_E)]
-        self.theta_LE_minus = [jnp.array(ang_dist['LE_minus'][i].Thetas) for i in range(self.n_tomo_bins_E)]
-        self.theta_LP = [jnp.array(ang_dist['LP'][i].Thetas) for i in range(self.n_tomo_bins_P)]
+        self.theta_LE_plus = [jnp.array(ad.Thetas) for ad in le_plus_list]
+        self.theta_LE_minus = [jnp.array(ad.Thetas) for ad in le_minus_list]
+        self.theta_LP = [jnp.array(ad.Thetas) for ad in lp_list]
 
-        le_plus_nw = [self._bin_average_nodes(ang_dist['LE_plus'][i]) for i in range(self.n_tomo_bins_E)]
-        le_minus_nw = [self._bin_average_nodes(ang_dist['LE_minus'][i]) for i in range(self.n_tomo_bins_E)]
-        lp_nw = [self._bin_average_nodes(ang_dist['LP'][i]) for i in range(self.n_tomo_bins_P)]
+        le_plus_nw = [_nw(ad) for ad in le_plus_list]
+        le_minus_nw = [_nw(ad) for ad in le_minus_list]
+        lp_nw = [_nw(ad) for ad in lp_list]
         self.nodes_LE_plus = [n for n, _ in le_plus_nw]
         self.w_LE_plus = [w for _, w in le_plus_nw]
         self.nodes_LE_minus = [n for n, _ in le_minus_nw]
@@ -865,21 +913,48 @@ class TheoryJAX:
         self.nodes_LP = [n for n, _ in lp_nw]
         self.w_LP = [w for _, w in lp_nw]
 
-        # EE uses same structure as LE (plus/minus for cosmic shear)
-        self.theta_EE_plus = self.theta_LE_plus  # Reuse LE plus bins
-        self.theta_EE_minus = self.theta_LE_minus  # Reuse LE minus bins
+        self.probes = ['LL', 'LE', 'LP']
 
-        # PP uses same structure as LP (galaxy clustering)
-        self.theta_PP = self.theta_LP  # Reuse LP bins
+        if not new_format or 'EE_plus' not in ang_dist:
+            # Old datasets carry no EE/EP/PP angular information; those
+            # probes cannot be predicted for them.
+            self.ee_pairs = []
+            self.ep_pairs = []
+            self.pp_bins = []
+            return
 
-        # EP uses LP structure (no plus/minus for cross-correlation)
-        self.theta_EP = self.theta_LP  # Reuse LP bins
+        # --- EE: all shear bin pairs (i, j), i >= j ---
+        self.ee_pairs = [(i, j) for i in range(self.n_tomo_bins_E)
+                         for j in range(i + 1)]
+        self.theta_EE_plus = [jnp.array(ang_dist['EE_plus'][i][j].Thetas)
+                              for i, j in self.ee_pairs]
+        self.theta_EE_minus = [jnp.array(ang_dist['EE_minus'][i][j].Thetas)
+                               for i, j in self.ee_pairs]
+        ee_plus_nw = [_nw(ang_dist['EE_plus'][i][j]) for i, j in self.ee_pairs]
+        ee_minus_nw = [_nw(ang_dist['EE_minus'][i][j]) for i, j in self.ee_pairs]
+        self.nodes_EE_plus = [n for n, _ in ee_plus_nw]
+        self.w_EE_plus = [w for _, w in ee_plus_nw]
+        self.nodes_EE_minus = [n for n, _ in ee_minus_nw]
+        self.w_EE_minus = [w for _, w in ee_minus_nw]
 
-        # Corresponding bin-average nodes/weights
-        self.nodes_EE_plus, self.w_EE_plus = self.nodes_LE_plus, self.w_LE_plus
-        self.nodes_EE_minus, self.w_EE_minus = self.nodes_LE_minus, self.w_LE_minus
-        self.nodes_PP, self.w_PP = self.nodes_LP, self.w_LP
-        self.nodes_EP, self.w_EP = self.nodes_LP, self.w_LP
+        # --- EP: shear bin i x position bin j, i >= j (source behind lens) ---
+        self.ep_pairs = [(i, j) for i in range(self.n_tomo_bins_E)
+                         for j in range(i + 1)]
+        self.theta_EP = [jnp.array(ang_dist['EP'][i][j].Thetas)
+                         for i, j in self.ep_pairs]
+        ep_nw = [_nw(ang_dist['EP'][i][j]) for i, j in self.ep_pairs]
+        self.nodes_EP = [n for n, _ in ep_nw]
+        self.w_EP = [w for _, w in ep_nw]
+
+        # --- PP: auto-bin only (cross-bin clustering is not simulated) ---
+        self.pp_bins = list(range(self.n_tomo_bins_P))
+        self.theta_PP = [jnp.array(ang_dist['PP'][b][b].Thetas)
+                         for b in self.pp_bins]
+        pp_nw = [_nw(ang_dist['PP'][b][b]) for b in self.pp_bins]
+        self.nodes_PP = [n for n, _ in pp_nw]
+        self.w_PP = [w for _, w in pp_nw]
+
+        self.probes = ['LL', 'LE', 'LP', 'EE', 'EP', 'PP']
 
     def apply_theta_min_cut(self, theta_min_arcmin: Optional[float] = None):
         """
@@ -936,16 +1011,42 @@ class TheoryJAX:
             self.nodes_LP[i], self.w_LP[i] = _filter_nodes(
                 self.nodes_LP[i], self.w_LP[i], f'LP_{i}')
 
-        # EE, EP, PP automatically filtered since they reference the same arrays
-        # Just update the references after filtering
-        self.theta_EE_plus = self.theta_LE_plus
-        self.theta_EE_minus = self.theta_LE_minus
-        self.theta_PP = self.theta_LP
-        self.theta_EP = self.theta_LP
-        self.nodes_EE_plus, self.w_EE_plus = self.nodes_LE_plus, self.w_LE_plus
-        self.nodes_EE_minus, self.w_EE_minus = self.nodes_LE_minus, self.w_LE_minus
-        self.nodes_PP, self.w_PP = self.nodes_LP, self.w_LP
-        self.nodes_EP, self.w_EP = self.nodes_LP, self.w_LP
+        # New probes have their own per-pair bins; filter them independently
+        if 'EE' in getattr(self, 'probes', []):
+            for k, (i, j) in enumerate(self.ee_pairs):
+                self.theta_EE_plus[k] = _filter(self.theta_EE_plus[k], f'EE_plus_{i}_{j}')
+                self.theta_EE_minus[k] = _filter(self.theta_EE_minus[k], f'EE_minus_{i}_{j}')
+                self.nodes_EE_plus[k], self.w_EE_plus[k] = _filter_nodes(
+                    self.nodes_EE_plus[k], self.w_EE_plus[k], f'EE_plus_{i}_{j}')
+                self.nodes_EE_minus[k], self.w_EE_minus[k] = _filter_nodes(
+                    self.nodes_EE_minus[k], self.w_EE_minus[k], f'EE_minus_{i}_{j}')
+            for k, (i, j) in enumerate(self.ep_pairs):
+                self.theta_EP[k] = _filter(self.theta_EP[k], f'EP_{i}_{j}')
+                self.nodes_EP[k], self.w_EP[k] = _filter_nodes(
+                    self.nodes_EP[k], self.w_EP[k], f'EP_{i}_{j}')
+            for k, b in enumerate(self.pp_bins):
+                self.theta_PP[k] = _filter(self.theta_PP[k], f'PP_{b}')
+                self.nodes_PP[k], self.w_PP[k] = _filter_nodes(
+                    self.nodes_PP[k], self.w_PP[k], f'PP_{b}')
+
+    def prediction_sizes(self) -> Dict[str, int]:
+        """
+        Number of data-vector entries per probe, as predict_data_vector_jax
+        will produce them (after any theta cut). Used to verify alignment
+        with the covariance before assembling a Fisher matrix.
+        """
+        sizes = {
+            'LL': self.w_LL_minus.shape[0] + self.w_LL_plus.shape[0],
+            'LE': sum(self.w_LE_minus[i].shape[0] + self.w_LE_plus[i].shape[0]
+                      for i in range(len(self.w_LE_plus))),
+            'LP': sum(w.shape[0] for w in self.w_LP),
+        }
+        if 'EE' in self.probes:
+            sizes['EE'] = sum(self.w_EE_minus[k].shape[0] + self.w_EE_plus[k].shape[0]
+                              for k in range(len(self.ee_pairs)))
+            sizes['EP'] = sum(w.shape[0] for w in self.w_EP)
+            sizes['PP'] = sum(w.shape[0] for w in self.w_PP)
+        return sizes
 
     def predict_data_vector_jax(self, Om, s8, ell_grid=None):
         """
@@ -968,6 +1069,13 @@ class TheoryJAX:
 
         # All entries are annulus averages over the angular bins (the loscov
         # data vector and covariance are bin-averaged, not point-evaluated).
+        #
+        # Ordering convention: within every probe section that has plus/minus
+        # components, xi_MINUS comes FIRST. This matches loscov's covariance
+        # blocks, which are assembled as np.block([[mm, mp], [pm, pp]]) in
+        # every fork and block type (e.g. loscov_fork LLLL.py:179), and was
+        # verified empirically: diag(LLLL) has the small (minus-signal-sized)
+        # entries in the first n_minus slots, giving uniform per-bin SNR.
 
         # LL predictions
         Cl_LL_vals = vmap(lambda ell: self.compute_Cl_LL_jax(Om, s8, ell))(ell_grid)
@@ -976,8 +1084,8 @@ class TheoryJAX:
             self.hankel_j0(Cl_LL_vals, ell_grid, self.nodes_LL_plus), self.w_LL_plus)
         xi_LL_minus = self._bin_average(
             self.hankel_j4(Cl_LL_vals, ell_grid, self.nodes_LL_minus), self.w_LL_minus)
-        predictions_parts.append(xi_LL_plus)
         predictions_parts.append(xi_LL_minus)
+        predictions_parts.append(xi_LL_plus)
 
         n_e_bins = len(self.theta_LE_plus)
         n_p_bins = len(self.theta_LP)
@@ -992,8 +1100,8 @@ class TheoryJAX:
             xi_LE_minus = self._bin_average(
                 self.hankel_j4(Cl_LE_vals, ell_grid, self.nodes_LE_minus[bin_idx]),
                 self.w_LE_minus[bin_idx])
-            predictions_parts.append(xi_LE_plus)
             predictions_parts.append(xi_LE_minus)
+            predictions_parts.append(xi_LE_plus)
 
         # LP predictions
         for bin_idx in range(n_p_bins):
@@ -1004,38 +1112,45 @@ class TheoryJAX:
                 self.w_LP[bin_idx])
             predictions_parts.append(xi_LP)
 
-        # EE predictions (cosmic shear auto-correlation)
-        for bin_idx in range(n_e_bins):
-            Cl_EE_vals = vmap(lambda ell: self.compute_Cl_EE_jax(Om, s8, ell, bin_idx))(ell_grid)
+        # EE predictions: all shear bin pairs (i, j) with i >= j, in loscov's
+        # enumeration order, each pair with its own SNR-optimised angular bins
+        if 'EE' in self.probes:
+            for k, (i, j) in enumerate(self.ee_pairs):
+                Cl_EE_vals = vmap(
+                    lambda ell: self.compute_Cl_EE_jax(Om, s8, ell, i, j))(ell_grid)
 
-            xi_EE_plus = self._bin_average(
-                self.hankel_j0(Cl_EE_vals, ell_grid, self.nodes_EE_plus[bin_idx]),
-                self.w_EE_plus[bin_idx])
-            xi_EE_minus = self._bin_average(
-                self.hankel_j4(Cl_EE_vals, ell_grid, self.nodes_EE_minus[bin_idx]),
-                self.w_EE_minus[bin_idx])
-            predictions_parts.append(xi_EE_plus)
-            predictions_parts.append(xi_EE_minus)
+                xi_EE_plus = self._bin_average(
+                    self.hankel_j0(Cl_EE_vals, ell_grid, self.nodes_EE_plus[k]),
+                    self.w_EE_plus[k])
+                xi_EE_minus = self._bin_average(
+                    self.hankel_j4(Cl_EE_vals, ell_grid, self.nodes_EE_minus[k]),
+                    self.w_EE_minus[k])
+                predictions_parts.append(xi_EE_minus)
+                predictions_parts.append(xi_EE_plus)
 
-        # EP predictions (cosmic shear × position cross-correlation)
-        for bin_idx in range(min(n_e_bins, n_p_bins)):
-            Cl_EP_vals = vmap(lambda ell: self.compute_Cl_EP_jax(Om, s8, ell, bin_idx))(ell_grid)
+        # EP predictions: shear bin i x position bin j pairs, i >= j
+        if 'EP' in self.probes:
+            for k, (i, j) in enumerate(self.ep_pairs):
+                Cl_EP_vals = vmap(
+                    lambda ell: self.compute_Cl_EP_jax(Om, s8, ell, i, j))(ell_grid)
 
-            xi_EP = self._bin_average(
-                self.hankel_j2(Cl_EP_vals, ell_grid, self.nodes_EP[bin_idx]),
-                self.w_EP[bin_idx])
-            predictions_parts.append(xi_EP)
+                xi_EP = self._bin_average(
+                    self.hankel_j2(Cl_EP_vals, ell_grid, self.nodes_EP[k]),
+                    self.w_EP[k])
+                predictions_parts.append(xi_EP)
 
-        # PP predictions (galaxy clustering auto-correlation)
+        # PP predictions (auto-bin galaxy clustering)
         # w(theta) is scalar x scalar, so the Hankel transform uses J0
         # (unlike LP/EP, which are spin-2 x scalar and use J2)
-        for bin_idx in range(n_p_bins):
-            Cl_PP_vals = vmap(lambda ell: self.compute_Cl_PP_jax(Om, s8, ell, bin_idx))(ell_grid)
+        if 'PP' in self.probes:
+            for k, b in enumerate(self.pp_bins):
+                Cl_PP_vals = vmap(
+                    lambda ell: self.compute_Cl_PP_jax(Om, s8, ell, b))(ell_grid)
 
-            xi_PP = self._bin_average(
-                self.hankel_j0(Cl_PP_vals, ell_grid, self.nodes_PP[bin_idx]),
-                self.w_PP[bin_idx])
-            predictions_parts.append(xi_PP)
+                xi_PP = self._bin_average(
+                    self.hankel_j0(Cl_PP_vals, ell_grid, self.nodes_PP[k]),
+                    self.w_PP[k])
+                predictions_parts.append(xi_PP)
 
         return jnp.concatenate(predictions_parts)
 

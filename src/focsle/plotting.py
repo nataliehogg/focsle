@@ -43,6 +43,7 @@ def plot_fisher_ellipse(
     alpha_1sig: float = 0.3,
     alpha_2sig: float = 0.15,
     show_2sigma: bool = True,
+    zorder: Optional[float] = None,
 ) -> bool:
     """
     Plot 1-sigma and 2-sigma ellipses for a Fisher matrix.
@@ -97,7 +98,8 @@ def plot_fisher_ellipse(
             edgecolor=color,
             linewidth=2,
             linestyle=linestyles[i],
-            label=label if n_sigma == 1 else None
+            label=label if n_sigma == 1 else None,
+            **({'zorder': zorder} if zorder is not None else {}),
         )
         ax.add_patch(ellipse)
 

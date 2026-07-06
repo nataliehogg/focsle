@@ -8,50 +8,25 @@ Outputs:
   optimistic_components.pdf    -- plot_constraints_overlay for optimistic
 """
 
-import numpy as np
 import matplotlib.pyplot as plt
 
 from focsle.fisher import FisherForecast
 from focsle.plotting import plot_comparison, plot_constraints_overlay
 
+# The pickles' 'Combined' is the full-covariance Fisher - use it as stored.
+# The old block-diagonal recompute that used to live here double-counted
+# shared information (audit B1).
 CONSERVATIVE = (
     'results/fisher_results_Nlens=1e4_sigL=0.1_Nbin_z=1_SNR_goal=8_Nbin_max=20_nsamp=1e6'
-    '_scalecut=0.5_gridding=10.pkl'
+    '_audited_060726_As_matched.pkl'
 )
 OPTIMISTIC = (
     'results/fisher_results_Nlens=1e5_sigL=0.05_Nbin_z=6_SNR_goal=8_Nbin_max=20_nsamp=1e6'
-    '_scalecut=0.5_gridding=10.pkl'
+    '_audited_060726_As_matched.pkl'
 )
 
 conservative = FisherForecast.load_results(CONSERVATIVE)
 optimistic   = FisherForecast.load_results(OPTIMISTIC)
-
-
-def recompute_combined(results):
-    """Replace Combined with block-diagonal sum of individual Fisher matrices.
-
-    The full-covariance-inverse approach stored in the pkl can be numerically
-    unstable for some datasets (ill-conditioned due to shared Q_L kernel
-    across LL/LE/LP), so we recompute it here.
-    """
-    F = (results['fisher_matrices']['LL'] +
-         results['fisher_matrices']['LE'] +
-         results['fisher_matrices']['LP'])
-    results['fisher_matrices']['Combined'] = F
-    C = np.linalg.inv(F)
-    errors = np.sqrt(np.diag(C))
-    fiducial = np.array(results['fiducial'])
-    results['constraints']['Combined'] = {
-        'errors': errors,
-        'covariance': C,
-        'correlation': C[0, 1] / (errors[0] * errors[1]),
-        'fractional_errors': errors / fiducial,
-    }
-    return results
-
-
-conservative = recompute_combined(conservative)
-optimistic   = recompute_combined(optimistic)
 
 # --- 3-panel comparison ---
 fig = plot_comparison(

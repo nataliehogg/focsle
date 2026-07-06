@@ -48,10 +48,11 @@ def main():
     pred = np.array(theory.predict_data_vector_jax(
         theory.cosmo_fid['Omega_m'], theory.cosmo_fid['sigma8']))
 
+    # Data vector is minus-first within each probe section (loscov convention)
     n_plus = len(theory.theta_LL_plus)
     n_minus = len(theory.theta_LL_minus)
-    xi_plus_theory = pred[:n_plus]
-    xi_minus_theory = pred[n_plus:n_plus + n_minus]
+    xi_minus_theory = pred[:n_minus]
+    xi_plus_theory = pred[n_minus:n_minus + n_plus]
 
     theta_plus = np.array(theory.theta_LL_plus) * RAD_TO_ARCMIN
     theta_minus = np.array(theory.theta_LL_minus) * RAD_TO_ARCMIN
