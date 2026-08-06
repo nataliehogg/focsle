@@ -90,6 +90,56 @@ def test_robust_symmetric_inverse():
     np.testing.assert_allclose(M2_inv, M2_inv.T, atol=1e-13)
 
 
+def _bare_forecast_for_inverse():
+    """Create a forecast instance without loading any science data."""
+    from focsle.fisher import FisherForecast
+
+    forecast = FisherForecast.__new__(FisherForecast)
+    forecast.rcond = 1e-10
+    return forecast
+
+
+def test_robust_symmetric_inverse_handles_large_unit_dynamic_range():
+    """Valid modes must survive even when probe variances span many decades."""
+    forecast = _bare_forecast_for_inverse()
+    scales = np.array([1e-8, 1e2])
+    correlation = np.array([[1.0, 0.3], [0.3, 1.0]])
+    covariance = np.outer(scales, scales) * correlation
+
+    covariance_inv = forecast._robust_symmetric_inverse(covariance)
+
+    np.testing.assert_allclose(
+        covariance_inv,
+        np.linalg.inv(covariance),
+        rtol=1e-12,
+        atol=0.0,
+    )
+
+
+def test_robust_symmetric_inverse_is_invariant_under_unit_rescaling():
+    """Changing the units of individual probes must not change the cutoff."""
+    forecast = _bare_forecast_for_inverse()
+    covariance = np.array([
+        [2.0, 0.3, 0.1],
+        [0.3, 1.5, 0.2],
+        [0.1, 0.2, 1.0],
+    ])
+    unit_scales = np.array([1e-5, 1.0, 1e6])
+    rescaled = np.outer(unit_scales, unit_scales) * covariance
+
+    expected = np.linalg.inv(covariance) / np.outer(unit_scales, unit_scales)
+    actual = forecast._robust_symmetric_inverse(rescaled)
+
+    np.testing.assert_allclose(actual, expected, rtol=1e-12, atol=0.0)
+
+
+def test_robust_symmetric_inverse_rejects_invalid_variances():
+    forecast = _bare_forecast_for_inverse()
+
+    with pytest.raises(np.linalg.LinAlgError, match="diagonal entries"):
+        forecast._robust_symmetric_inverse(np.array([[1.0, 0.0], [0.0, 0.0]]))
+
+
 def test_covariance_symmetry():
     """Test that block covariance construction maintains symmetry."""
     from focsle.data_loader import build_full_covariance

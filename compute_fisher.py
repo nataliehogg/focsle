@@ -81,6 +81,17 @@ def main():
     )
 
     parser.add_argument(
+        '--custom-probes',
+        nargs='+',
+        choices=('LL', 'LE', 'LP', 'EE', 'EP', 'PP'),
+        default=None,
+        help=(
+            'Also compute and save one full-covariance custom probe '
+            'combination, e.g. --custom-probes EE EP PP'
+        )
+    )
+
+    parser.add_argument(
         '--plot',
         action='store_true',
         help='Generate and save constraint plots'
@@ -134,6 +145,12 @@ def main():
 
     # Compute Fisher matrices
     results = forecast.compute_fisher()
+
+    if args.custom_probes:
+        custom = forecast.compute_custom_fisher(args.custom_probes)
+        label = custom['probe_combination']
+        forecast.fisher_matrices[label] = custom['fisher_matrix']
+        forecast.constraints[label] = custom['constraints']
 
     # Print summary
     if verbose:

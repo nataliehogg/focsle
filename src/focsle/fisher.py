@@ -136,10 +136,11 @@ class FisherForecast:
             Om_range: (min, max) range for Omega_m
             As_range: (min, max) range for A_s
             theta_min_arcmin: Minimum theta (arcmin); angular bins below are cut
-            rcond: Relative eigenvalue threshold for covariance pseudo-inverses;
-                   modes with eig <= rcond * max(eig) are projected out (they
-                   sit at/below the Monte Carlo noise floor of the simulated
-                   covariance). Check constraint stability against this value.
+            rcond: Relative eigenvalue threshold for covariance pseudo-inverses.
+                   The threshold is applied to the dimensionless correlation
+                   matrix so that it is independent of probe units. Modes with
+                   eig <= rcond * max(eig) are projected out. Check constraint
+                   stability against this value.
         """
         self.rcond = rcond
         if self.verbose:
@@ -591,21 +592,22 @@ class FisherForecast:
                                   rcond: Optional[float] = None,
                                   label: str = '') -> np.ndarray:
         """
-        Compute a symmetric pseudo-inverse, projecting out unusable modes.
+        Compute a scale-invariant symmetric pseudo-inverse.
 
         Covariance blocks are assembled from independently Monte-Carlo-
         integrated elements (loscov), so the matrix is not guaranteed positive
         definite: eigenvalues at or below the MC noise floor can come out
-        near-zero or negative. Such modes carry no reliable information, so
-        they are DISCARDED (inverse eigenvalue set to zero = zero Fisher
-        weight along that direction). This is the conservative treatment;
-        the previous behaviour (clipping eigenvalues up to max*1e-10 and
-        inverting) gave those same modes enormous spurious weight instead.
+        near-zero or negative. The covariance is first normalised to a
+        dimensionless correlation matrix before applying the eigenvalue cut.
+        This is essential when probes have very different physical units: a
+        cutoff on the raw covariance would otherwise discard valid modes just
+        because their variances are numerically small. Unusable correlation
+        modes are discarded (zero Fisher weight along that direction).
 
         Args:
             M: Symmetric matrix to invert
             verbose: Print diagnostic information
-            rcond: Relative eigenvalue threshold; modes with
+            rcond: Relative correlation-eigenvalue threshold; modes with
                    eig <= rcond * max(eig) are discarded.
                    Defaults to self.rcond (set in __init__ / setup()).
             label: Name used in the warning message
@@ -616,13 +618,26 @@ class FisherForecast:
         if rcond is None:
             rcond = getattr(self, 'rcond', 1e-10)
 
-        M_sym = (M + M.T) / 2  # Symmetrize input
-        eigenvalues, eigenvectors = np.linalg.eigh(M_sym)
+        M_sym = np.asarray((M + M.T) / 2, dtype=float)
+        diagonal = np.diag(M_sym)
+        invalid_diagonal = ~np.isfinite(diagonal) | (diagonal <= 0)
+        if np.any(invalid_diagonal):
+            raise np.linalg.LinAlgError(
+                f"Covariance matrix {label or ''} has "
+                f"{int(np.sum(invalid_diagonal))} non-positive or non-finite "
+                "diagonal entries"
+            )
+
+        scales = np.sqrt(diagonal)
+        scale_outer = np.outer(scales, scales)
+        correlation = M_sym / scale_outer
+        correlation = (correlation + correlation.T) / 2
+        eigenvalues, eigenvectors = np.linalg.eigh(correlation)
 
         lam_max = eigenvalues[-1]
         if lam_max <= 0:
             raise np.linalg.LinAlgError(
-                f"Covariance matrix {label or ''} has no positive eigenvalues"
+                f"Correlation matrix {label or ''} has no positive eigenvalues"
             )
 
         threshold = rcond * lam_max
@@ -636,7 +651,7 @@ class FisherForecast:
             warnings.warn(
                 f"Covariance pseudo-inverse{f' [{label}]' if label else ''}: "
                 f"discarded {n_discarded}/{len(eigenvalues)} modes with "
-                f"eigenvalue <= {threshold:.3e} (rcond={rcond:g}, "
+                f"correlation eigenvalue <= {threshold:.3e} (rcond={rcond:g}, "
                 f"{int(np.sum(eigenvalues <= 0))} were non-positive). "
                 "These data directions contribute zero Fisher information.",
                 RuntimeWarning,
@@ -647,7 +662,8 @@ class FisherForecast:
                       f"{lam_max / eigenvalues[keep].min():.2e})")
 
         inv_eigenvalues = np.where(keep, 1.0 / np.where(keep, eigenvalues, 1.0), 0.0)
-        M_inv = (eigenvectors * inv_eigenvalues) @ eigenvectors.T
+        correlation_inv = (eigenvectors * inv_eigenvalues) @ eigenvectors.T
+        M_inv = correlation_inv / scale_outer
 
         return (M_inv + M_inv.T) / 2
 
