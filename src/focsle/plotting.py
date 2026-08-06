@@ -33,6 +33,44 @@ def _chi2_2d_scale(n_sigma: float) -> float:
     return math.sqrt(-2.0 * math.log(1.0 - p))
 
 
+
+PARAMETER_LABELS = {
+    'Omega_m': r'$\Omega_{\rm m}$',
+    'sigma_8': r'$\sigma_8$',
+    'w0': r'$w_0$',
+    'wa': r'$w_a$',
+}
+
+
+def marginalize_fisher_to_pair(
+    fisher: np.ndarray,
+    fiducial,
+    param_names,
+    parameter_pair,
+):
+    """Return the marginalized 2D Fisher matrix and fiducial pair."""
+    names = list(param_names)
+    pair = tuple(parameter_pair)
+    if len(pair) != 2 or pair[0] == pair[1]:
+        raise ValueError("parameter_pair must contain two distinct names")
+    missing = [name for name in pair if name not in names]
+    if missing:
+        raise ValueError(
+            f"Plot parameter(s) {missing} were not varied; available: {names}"
+        )
+    fisher = np.asarray(fisher, dtype=float)
+    if fisher.shape != (len(names), len(names)):
+        raise ValueError(
+            f"Fisher shape {fisher.shape} does not match {len(names)} "
+            "parameter names"
+        )
+    covariance = np.linalg.inv(fisher)
+    indices = [names.index(name) for name in pair]
+    covariance_pair = covariance[np.ix_(indices, indices)]
+    fisher_pair = np.linalg.inv(covariance_pair)
+    fiducial_pair = tuple(np.asarray(fiducial, dtype=float)[indices])
+    return fisher_pair, fiducial_pair
+
 def plot_fisher_ellipse(
     F: np.ndarray,
     fiducial: Tuple[float, float],
@@ -113,9 +151,10 @@ def plot_constraints(
     colors: Dict[str, str] = None,
     output_file: Optional[str] = None,
     title: Optional[str] = None,
+    parameter_pair: Optional[Tuple[str, str]] = None,
 ) -> plt.Figure:
     """
-    Plot Fisher ellipse constraints for multiple probes.
+    Plot marginalized Fisher constraints for one parameter pair.
 
     Args:
         results: Dictionary containing Fisher matrices and fiducial values
@@ -124,6 +163,8 @@ def plot_constraints(
         colors: Dictionary mapping probe names to colors
         output_file: If provided, save figure to this path
         title: Optional figure title
+        parameter_pair: Two varied parameters to show. Defaults to
+            the first two entries in results['param_names'].
 
     Returns:
         Matplotlib figure
@@ -156,6 +197,11 @@ def plot_constraints(
         axes = [axes]
 
     fiducial = results['fiducial']
+    param_names = results.get(
+        'param_names', ['Omega_m', 'sigma_8']
+    )
+    if parameter_pair is None:
+        parameter_pair = tuple(param_names[:2])
 
     probe_titles = {
         'LL': 'LOS--LOS',
@@ -167,19 +213,26 @@ def plot_constraints(
     for ax, probe in zip(axes, probes):
         F = results['fisher_matrices'][probe]
         color = colors.get(probe, 'steelblue')
+        try:
+            F_pair, fiducial_pair = marginalize_fisher_to_pair(
+                F, fiducial, param_names, parameter_pair
+            )
+        except np.linalg.LinAlgError:
+            print(f'Warning: Singular Fisher matrix for {probe}')
+            continue
 
         plot_fisher_ellipse(
-            F, fiducial, ax,
+            F_pair, fiducial_pair, ax,
             color=color,
             label=probe,
         )
 
         # Mark fiducial
-        ax.plot(fiducial[0], fiducial[1], 'k+', markersize=10, markeredgewidth=2)
+        ax.plot(*fiducial_pair, 'k+', markersize=10, markeredgewidth=2)
 
         # Labels
-        ax.set_xlabel(r'$\Omega_{\rm m}$',) #fontsize=14)
-        ax.set_ylabel(r'$\sigma_8$', )#fontsize=14)
+        ax.set_xlabel(PARAMETER_LABELS.get(parameter_pair[0], parameter_pair[0]))
+        ax.set_ylabel(PARAMETER_LABELS.get(parameter_pair[1], parameter_pair[1]))
         ax.set_title(f'{probe}',)# fontsize=13)
         ax.legend(loc='best')#, fontsize=11)
         ax.grid(False)
@@ -380,41 +433,46 @@ def plot_comparison(
 
 
 def print_constraints_table(results: Dict, probes: List[str] = None):
-    """
-    Print a formatted table of parameter constraints.
-
-    Args:
-        results: Dictionary containing constraints
-        probes: List of probes to include (default: all available)
-    """
+    """Print marginalized errors for every varied parameter."""
     if probes is None:
         probes = list(results.get('constraints', {}).keys())
+    param_names = list(results.get(
+        'param_names', ['Omega_m', 'sigma_8']
+    ))
+    fiducial = np.asarray(results['fiducial'], dtype=float)
 
-    fiducial = results['fiducial']
-
-    print("\n" + "=" * 70)
+    width = 20
+    total_width = 14 + width * len(param_names)
+    print("\n" + "=" * total_width)
     print("Parameter Constraints Summary")
-    print("=" * 70)
-    print(f"Fiducial: Omega_m = {fiducial[0]:.4f}, sigma_8 = {fiducial[1]:.4f}")
-    print("-" * 70)
-    print(f"{'Probe':<12} {'sigma(Om)':<12} {'%(Om)':<10} {'sigma(s8)':<12} {'%(s8)':<10} {'corr':<8}")
-    print("-" * 70)
+    print("=" * total_width)
+    values = ", ".join(
+        f"{name}={value:.6g}" for name, value in zip(param_names, fiducial)
+    )
+    print(f"Fiducial: {values}")
+    print("-" * total_width)
+    header = f"{'Probe':<14}" + "".join(
+        f"{'sigma(' + name + ')':<{width}}" for name in param_names
+    )
+    print(header)
+    print("-" * total_width)
 
     for probe in probes:
-        c = results['constraints'].get(probe)
-        if c is None:
-            print(f"{probe:<12} {'SINGULAR':<12}")
+        constraints = results['constraints'].get(probe)
+        if constraints is None:
+            print(f"{probe:<14}{'SINGULAR':<{width}}")
             continue
-
-        print(f"{probe:<12} "
-              f"{c['errors'][0]:<12.4f} "
-              f"{100 * c['fractional_errors'][0]:<10.1f} "
-              f"{c['errors'][1]:<12.4f} "
-              f"{100 * c['fractional_errors'][1]:<10.1f} "
-              f"{c['correlation']:<8.3f}")
-
-    print("=" * 70)
-
+        cells = []
+        for error, fractional in zip(
+                constraints['errors'], constraints['fractional_errors']):
+            if np.isfinite(fractional):
+                cells.append(f"{error:.5g} ({100 * fractional:.2f}%)")
+            else:
+                cells.append(f"{error:.5g}")
+        print(f"{probe:<14}" + "".join(
+            f"{cell:<{width}}" for cell in cells
+        ))
+    print("=" * total_width)
 
 def plot_fom_comparison(
     results_list: List[Dict],

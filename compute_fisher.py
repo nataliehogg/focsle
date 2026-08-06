@@ -74,6 +74,31 @@ def main():
     )
 
     parser.add_argument(
+        '--parameters',
+        nargs='+',
+        choices=FisherForecast.SUPPORTED_PARAMETERS,
+        default=list(FisherForecast.DEFAULT_PARAMETERS),
+        help=(
+            'Ordered parameters to vary (default: Omega_m sigma_8). '
+            'Example: --parameters Omega_m sigma_8 w0 wa'
+        )
+    )
+
+    parser.add_argument(
+        '--w0-step',
+        type=float,
+        default=0.05,
+        help='Central CAMB response step for w0 (default: 0.05)'
+    )
+
+    parser.add_argument(
+        '--wa-step',
+        type=float,
+        default=0.1,
+        help='Central CAMB response step for wa (default: 0.1)'
+    )
+
+    parser.add_argument(
         '--theta-min-arcmin',
         type=float,
         default=None,
@@ -98,6 +123,18 @@ def main():
     )
 
     parser.add_argument(
+        '--plot-parameters',
+        nargs=2,
+        choices=FisherForecast.SUPPORTED_PARAMETERS,
+        default=None,
+        metavar=('X_PARAMETER', 'Y_PARAMETER'),
+        help=(
+            'Marginalized parameter pair to plot. Defaults to the '
+            'first two entries in --parameters.'
+        )
+    )
+
+    parser.add_argument(
         '--list-datasets',
         type=str,
         metavar='DATA_ROOT',
@@ -111,6 +148,25 @@ def main():
     )
 
     args = parser.parse_args()
+
+    if args.plot:
+        plot_parameters = (
+            args.plot_parameters if args.plot_parameters is not None
+            else args.parameters[:2]
+        )
+        if len(plot_parameters) != 2:
+            parser.error(
+                "--plot requires at least two --parameters, or an explicit "
+                "two-name --plot-parameters selection"
+            )
+        missing_plot_parameters = [
+            name for name in plot_parameters if name not in args.parameters
+        ]
+        if missing_plot_parameters:
+            parser.error(
+                "--plot-parameters must be included in --parameters; missing "
+                f"{missing_plot_parameters}"
+            )
 
     # List datasets mode
     if args.list_datasets:
@@ -140,7 +196,10 @@ def main():
         nOm=args.nOm,
         nAs=args.nAs,
         As_range=tuple(args.As_range),
-        theta_min_arcmin=args.theta_min_arcmin
+        theta_min_arcmin=args.theta_min_arcmin,
+        param_names=args.parameters,
+        w0_step=args.w0_step,
+        wa_step=args.wa_step,
     )
 
     # Compute Fisher matrices
@@ -161,7 +220,12 @@ def main():
         output_file = args.output
     else:
         dataset_name = Path(args.data_dir).name
-        output_file = f'results/fisher_results_{dataset_name}.pkl'
+        parameter_tag = '-'.join(args.parameters)
+        default_tag = '-'.join(FisherForecast.DEFAULT_PARAMETERS)
+        suffix = '' if parameter_tag == default_tag else f'_{parameter_tag}'
+        output_file = (
+            f'results/fisher_results_{dataset_name}{suffix}.pkl'
+        )
 
     Path(output_file).parent.mkdir(parents=True, exist_ok=True)
     forecast.save_results(output_file)
@@ -169,9 +233,14 @@ def main():
     # Generate plots if requested
     if args.plot:
         plot_file = Path(output_file).with_suffix('.png')
+        parameter_pair = (
+            tuple(args.plot_parameters) if args.plot_parameters
+            else tuple(args.parameters[:2])
+        )
         fig = plot_constraints(
             results,
             probes=['LL', 'LE', 'LP', 'Combined'],
+            parameter_pair=parameter_pair,
             output_file=str(plot_file)
         )
 

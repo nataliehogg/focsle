@@ -65,6 +65,21 @@ class FisherForecast:
         >>> forecast.save_results('my_results.pkl')
     """
 
+    SUPPORTED_PARAMETERS = ('Omega_m', 'sigma_8', 'w0', 'wa')
+    DEFAULT_PARAMETERS = ('Omega_m', 'sigma_8')
+    _FIDUCIAL_KEYS = {
+        'Omega_m': 'Omega_m',
+        'sigma_8': 'sigma8',
+        'w0': 'w0',
+        'wa': 'wa',
+    }
+    _PRINT_LABELS = {
+        'Omega_m': 'Omega_m',
+        'sigma_8': 'sigma_8',
+        'w0': 'w0',
+        'wa': 'wa',
+    }
+
     def __init__(self, data_dir: str, lens_file: Optional[str] = None,
                  cosmo_fid: Optional[Dict] = None, verbose: bool = True):
         self.data_dir = Path(data_dir)
@@ -102,6 +117,8 @@ class FisherForecast:
         self.C_EP_inv = None
         self.C_PP_inv = None
         self.sizes = None
+        self.param_names = list(self.DEFAULT_PARAMETERS)
+        self.fiducial = None
         self._is_setup = False
 
     @classmethod
@@ -117,11 +134,37 @@ class FisherForecast:
         """
         return list_available_datasets(data_root)
 
+    @classmethod
+    def _normalise_param_names(cls, param_names=None) -> List[str]:
+        """Validate and return an ordered, duplicate-free parameter list."""
+        if param_names is None:
+            return list(cls.DEFAULT_PARAMETERS)
+        names = list(param_names)
+        if not names:
+            raise ValueError("At least one forecast parameter is required")
+        unknown = [name for name in names
+                   if name not in cls.SUPPORTED_PARAMETERS]
+        if unknown:
+            raise ValueError(
+                f"Unsupported forecast parameter(s): {unknown}; choose from "
+                f"{list(cls.SUPPORTED_PARAMETERS)}"
+            )
+        if len(set(names)) != len(names):
+            raise ValueError("Forecast parameter names must not be repeated")
+        return names
+
+    def _fiducial_for(self, param_names: List[str]) -> List[float]:
+        """Return fiducial values in exactly the requested parameter order."""
+        return [float(self.theory.cosmo_fid[self._FIDUCIAL_KEYS[name]])
+                for name in param_names]
+
     def setup(self, nOm: int = 5, nAs: int = 5, nz: int = 50, nk: int = 100,
               Om_range: Tuple[float, float] = (0.25, 0.40),
               As_range: Tuple[float, float] = (1.5e-9, 2.7e-9),
               theta_min_arcmin: Optional[float] = None,
-              rcond: float = 1e-10):
+              rcond: float = 1e-10,
+              param_names: Optional[List[str]] = None,
+              w0_step: float = 0.05, wa_step: float = 0.1):
         """
         Setup the forecast calculator.
 
@@ -141,8 +184,16 @@ class FisherForecast:
                    matrix so that it is independent of probe units. Modes with
                    eig <= rcond * max(eig) are projected out. Check constraint
                    stability against this value.
+            param_names: Ordered subset of Omega_m, sigma_8, w0, and wa.
+                The default retains the existing Omega_m--sigma_8 forecast.
+            w0_step, wa_step: Central CAMB stencil steps. Used only when
+                w0 or wa is requested.
         """
         self.rcond = rcond
+        self.param_names = self._normalise_param_names(param_names)
+        use_dark_energy = any(
+            name in ('w0', 'wa') for name in self.param_names
+        )
         if self.verbose:
             print("=" * 70)
             print("Setting up Fisher Forecast")
@@ -156,6 +207,13 @@ class FisherForecast:
             nOm=nOm, nAs=nAs, nz=nz, nk=nk,
             verbose=self.verbose
         )
+
+        # The distance-dependent galaxy kernels must see the response
+        # tables during their precomputation, so this ordering is required.
+        if use_dark_energy:
+            self.theory.setup_dark_energy_responses(
+                w0_step=w0_step, wa_step=wa_step, verbose=self.verbose
+            )
 
         # Setup galaxy distributions
         if self.verbose:
@@ -293,32 +351,48 @@ class FisherForecast:
                 print(f"Applied theta_min = {theta_min_arcmin} arcmin")
 
     def compute_fisher(self, param_names: List[str] = None) -> Dict:
-        """
-        Compute Fisher matrices for all probes.
+        """Compute Fisher matrices for an ordered subset of parameters.
 
-        Args:
-            param_names: Parameter names (default: ['Omega_m', 'sigma_8'])
-
-        Returns:
-            Dictionary containing Fisher matrices and constraints for each probe
+        When ``param_names`` is omitted, the selection made during ``setup``
+        is used. A different subset can be requested after a dark-energy setup,
+        but w0/wa cannot be introduced after galaxy kernels were built without
+        their response tables.
         """
         if not self._is_setup:
             raise RuntimeError("Must call setup() before compute_fisher()")
 
         if param_names is None:
-            param_names = ['Omega_m', 'sigma_8']
+            param_names = list(getattr(
+                self, 'param_names', self.DEFAULT_PARAMETERS
+            ))
+        else:
+            param_names = self._normalise_param_names(param_names)
+
+        use_dark_energy = any(name in ('w0', 'wa') for name in param_names)
+        if use_dark_energy and not hasattr(self.theory, 'dlnPk_dw0'):
+            raise RuntimeError(
+                "w0/wa were requested after a two-parameter setup; rerun "
+                "setup(param_names=...) so the CAMB and kernel responses are "
+                "prepared before computing the Fisher matrix"
+            )
+
+        self.param_names = list(param_names)
+        fiducial = self._fiducial_for(self.param_names)
+        self.fiducial = fiducial
+        # Avoid mixing matrices of different dimensionality if this method is
+        # intentionally called again with another subset.
+        self.fisher_matrices = {}
+        self.constraints = {}
 
         if self.verbose:
             print("\n" + "=" * 70)
             print("Computing Fisher Matrices")
             print("=" * 70)
-
-        # Get fiducial parameters
-        fiducial = [self.theory.cosmo_fid['Omega_m'], self.theory.cosmo_fid['sigma8']]
-        self.fiducial = fiducial
-
-        if self.verbose:
-            print(f"\nFiducial: Omega_m = {fiducial[0]:.4f}, sigma_8 = {fiducial[1]:.4f}")
+            values = ", ".join(
+                f"{name} = {value:.6g}"
+                for name, value in zip(self.param_names, fiducial)
+            )
+            print(f"\nFiducial: {values}")
 
         # Compute Jacobian
         if self.verbose:
@@ -326,8 +400,20 @@ class FisherForecast:
             print("  (this may take a minute)")
 
         def data_vec_func(params):
-            Om, s8 = params[0], params[1]
-            return self.theory.predict_data_vector_jax(Om, s8)
+            values = {
+                name: self.theory.cosmo_fid[key]
+                for name, key in self._FIDUCIAL_KEYS.items()
+            }
+            for index, name in enumerate(self.param_names):
+                values[name] = params[index]
+            if use_dark_energy:
+                return self.theory.predict_data_vector_jax(
+                    values['Omega_m'], values['sigma_8'],
+                    w0=values['w0'], wa=values['wa'],
+                )
+            return self.theory.predict_data_vector_jax(
+                values['Omega_m'], values['sigma_8']
+            )
 
         params_fid = jnp.array(fiducial)
         jacobian_func = jacfwd(data_vec_func)
@@ -508,7 +594,7 @@ class FisherForecast:
             'fisher_matrices': self.fisher_matrices,
             'constraints': self.constraints,
             'fiducial': fiducial,
-            'param_names': param_names,
+            'param_names': list(self.param_names),
         }
 
     def compute_custom_fisher(self, probe_names: List[str]) -> Dict:
@@ -575,17 +661,14 @@ class FisherForecast:
 
         if self.verbose:
             print(f"\nCustom combination: {probe_label}")
-            if constraints:
-                print(f"   sigma(Omega_m) = {constraints['errors'][0]:.4f} "
-                      f"({100 * constraints['fractional_errors'][0]:.1f}%)")
-                print(f"   sigma(sigma_8) = {constraints['errors'][1]:.4f} "
-                      f"({100 * constraints['fractional_errors'][1]:.1f}%)")
+            self._print_constraint_values(constraints)
 
         return {
             'fisher_matrix': F_custom,
             'constraints': constraints,
             'fiducial': self.fiducial,
             'probe_combination': probe_label,
+            'param_names': list(self.param_names),
         }
 
     def _robust_symmetric_inverse(self, M: np.ndarray, verbose: bool = False,
@@ -776,37 +859,58 @@ class FisherForecast:
             offset += sum(info['section_sizes'])
             self.sizes[f'n_{probe}'] = sum(info['section_sizes'])
 
-    def _analyze_constraints(self, F: np.ndarray, fiducial: List[float]) -> Optional[Dict]:
-        """Extract parameter constraints from Fisher matrix."""
+    def _analyze_constraints(
+            self, F: np.ndarray, fiducial: List[float]) -> Optional[Dict]:
+        """Extract marginalized constraints from a Fisher matrix."""
         try:
-            C = np.linalg.inv(F)
-            errors = np.sqrt(np.diag(C))
-            corr = C[0, 1] / (errors[0] * errors[1])
-
-            return {
-                'errors': errors,
-                'covariance': C,
-                'correlation': corr,
-                'fractional_errors': errors / np.array(fiducial),
-            }
+            covariance = np.linalg.inv(F)
         except np.linalg.LinAlgError:
             return None
+
+        errors = np.sqrt(np.diag(covariance))
+        correlation_matrix = covariance / np.outer(errors, errors)
+        fiducial_array = np.asarray(fiducial, dtype=float)
+        fractional_errors = np.full_like(errors, np.nan, dtype=float)
+        nonzero = np.abs(fiducial_array) > 0.0
+        fractional_errors[nonzero] = (
+            errors[nonzero] / np.abs(fiducial_array[nonzero])
+        )
+        first_pair_correlation = (
+            float(correlation_matrix[0, 1]) if len(errors) > 1 else np.nan
+        )
+        return {
+            'errors': errors,
+            'covariance': covariance,
+            # Backward-compatible first-pair scalar used by existing plots.
+            'correlation': first_pair_correlation,
+            'correlation_matrix': correlation_matrix,
+            'fractional_errors': fractional_errors,
+        }
+
+    def _print_constraint_values(self, results: Optional[Dict]):
+        """Print marginalized errors in the active parameter order."""
+        if not results:
+            print("   WARNING: Fisher matrix is singular!")
+            return
+        for index, name in enumerate(self.param_names):
+            label = self._PRINT_LABELS[name]
+            error = results['errors'][index]
+            fractional = results['fractional_errors'][index]
+            if np.isfinite(fractional):
+                print(f"   sigma({label}) = {error:.6g} "
+                      f"({100 * fractional:.2f}%)")
+            else:
+                print(f"   sigma({label}) = {error:.6g}")
 
     def _print_constraints(self, probe: str):
         """Print constraints for a probe."""
         if not self.verbose:
             return
-
-        results = self.constraints.get(probe)
-        if results:
-            print(f"   sigma(Omega_m) = {results['errors'][0]:.4f} "
-                  f"({100 * results['fractional_errors'][0]:.1f}%)")
-            print(f"   sigma(sigma_8) = {results['errors'][1]:.4f} "
-                  f"({100 * results['fractional_errors'][1]:.1f}%)")
-            if probe == 'Combined':
-                print(f"   Correlation: {results['correlation']:.3f}")
-        else:
-            print("   WARNING: Fisher matrix is singular!")
+        self._print_constraint_values(self.constraints.get(probe))
+        if probe == 'Combined' and self.constraints.get(probe):
+            correlation = self.constraints[probe]['correlation_matrix']
+            if correlation.shape == (2, 2):
+                print(f"   Correlation: {correlation[0, 1]:.3f}")
 
     def save_results(self, output_file: str):
         """
@@ -826,6 +930,7 @@ class FisherForecast:
             'n_LE': self.sizes['n_LE'],
             'n_LP': self.sizes['n_LP'],
             'nbins': self.nbins,
+            'param_names': list(self.param_names),
         }
         # Add new probe sizes if they exist
         if 'n_EE' in self.sizes:
@@ -837,6 +942,10 @@ class FisherForecast:
             'fisher_matrices': self.fisher_matrices,
             'constraints': self.constraints,
             'fiducial': self.fiducial,
+            'param_names': list(self.param_names),
+            'dark_energy_response_metadata': getattr(
+                self.theory, 'dark_energy_response_metadata', None
+            ),
             'metadata': metadata
         }
 
