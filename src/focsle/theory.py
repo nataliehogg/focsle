@@ -19,6 +19,8 @@ from functools import partial
 import camb
 from camb import model
 
+from .camb_cache import CambArrayCache, CambCacheCorruptionError
+
 # Try to use GPU if available, otherwise fall back to CPU cleanly
 try:
     jax.config.update('jax_platform_name', 'gpu')
@@ -79,6 +81,11 @@ N_ELL_DEFAULT = 300        # Number of ell points for the C_ell grid
 OGATA_N = 10000  # number of Bessel-zero nodes
 OGATA_H = 1e-2   # step parameter
 
+# Bump these when the corresponding CAMB calculation or stored array semantics
+# change. They are part of the persistent cache identity.
+CAMB_POWER_GRID_PRODUCT_VERSION = 1
+CAMB_BACKGROUND_GRID_PRODUCT_VERSION = 1
+
 
 class TheoryJAX:
     """
@@ -136,6 +143,11 @@ class TheoryJAX:
         self.lens_file = lens_file
         self._setup_lens_distribution()
         self.theta_masks = {}
+
+        # CAMB arrays persist across Python processes. The directory defaults
+        # to ~/.cache/focsle/camb and can be overridden with
+        # FOCSLE_CAMB_CACHE_DIR.
+        self.camb_cache = CambArrayCache()
 
         # Precompute Ogata quadrature nodes/weights for J0, J2, J4 Hankel
         # transforms (constants; computed once with scipy, used by JAX).
@@ -198,22 +210,9 @@ class TheoryJAX:
                       As_range: Tuple[float, float] = (1.5e-9, 2.7e-9),
                       nOm: int = 5, nAs: int = 5, nz: int = 50, nk: int = 100,
                       verbose: bool = True):
-        """
-        Pre-compute CAMB P(k) on a grid of cosmologies (varying Omega_m, A_s).
-
-        This is the computationally expensive part - done once at initialization.
-
-        Args:
-            Om_range: (min, max) range for Omega_m
-            As_range: (min, max) range for A_s
-            nOm: Number of Omega_m grid points
-            nAs: Number of A_s grid points
-            nz: Number of redshift grid points
-            nk: Number of wavenumber grid points
-            verbose: Print progress messages
-        """
+        """Set up the cached CAMB matter-power grid used by JAX."""
         if verbose:
-            print("\nPre-computing CAMB P(k) grid...")
+            print("\nSetting up CAMB P(k) grid...")
             print(f"  Omega_m range: {Om_range}, {nOm} points")
             print(f"  A_s range: {As_range}, {nAs} points")
 
@@ -222,94 +221,214 @@ class TheoryJAX:
         z_grid = np.linspace(Z_MIN_CAMB, Z_MAX_CAMB, nz)
         k_grid = np.logspace(np.log10(K_MIN_CAMB), np.log10(K_MAX_CAMB), nk)
 
-        # Pre-allocate
-        Pk_grid = np.zeros((nOm, nAs, nz, nk))
-        sigma8_grid = np.zeros((nOm, nAs))
+        configuration = self._power_grid_cache_configuration(
+            Om_grid, As_grid, z_grid, k_grid
+        )
+        arrays, cache_hit = self.camb_cache.get_or_compute(
+            configuration,
+            lambda: self._compute_power_grid(
+                Om_grid, As_grid, z_grid, k_grid, verbose=verbose
+            ),
+        )
+        self._validate_power_grid_arrays(
+            arrays, nOm=nOm, nAs=nAs, nz=nz, nk=nk
+        )
+
+        self.Om_grid = jnp.array(arrays['Om_grid'])
+        self.As_grid = jnp.array(arrays['As_grid'])
+        self.z_grid = jnp.array(arrays['z_grid'])
+        self.k_grid = jnp.array(arrays['k_grid'])
+        self.Pk_grid = jnp.array(arrays['Pk_grid'])
+        self.sigma8_grid = jnp.array(arrays['sigma8_grid'])
+
+        if verbose:
+            source = "persistent cache" if cache_hit else "new CAMB calculations"
+            print(f"  P(k) grid ready on GPU ({source})")
+            print("  sigma_8 mapping stored for each (Omega_m, A_s) grid point")
+            print(f"  Cache entry: {self.camb_cache.path_for(configuration)}")
+
+        self._setup_background(Om_grid, verbose=verbose)
+
+    def _power_grid_cache_configuration(self, Om_grid, As_grid, z_grid, k_grid):
+        """Complete scientific/numerical identity of the matter-power grid."""
+        return {
+            'product': 'matter_power_grid',
+            'product_version': CAMB_POWER_GRID_PRODUCT_VERSION,
+            'camb_version': getattr(camb, '__version__', 'unknown'),
+            'cosmology': {
+                'H0': self.cosmo_fid['H0'],
+                'ombh2': self.cosmo_fid['ombh2'],
+                'mnu': self.cosmo_fid['mnu'],
+                'omk': self.cosmo_fid['omk'],
+                'tau': self.cosmo_fid['tau'],
+                'ns': self.cosmo_fid['ns'],
+                'dark_energy': 'CAMB_default_LambdaCDM',
+            },
+            'calculation': {
+                'nonlinear': 'NonLinear_both',
+                'interpolator_nonlinear': True,
+                'hubble_units': False,
+                'k_hunit': False,
+                'matter_power_kmax': K_MAX_CAMB,
+            },
+            'Om_grid': Om_grid,
+            'As_grid': As_grid,
+            'z_grid': z_grid,
+            'k_grid': k_grid,
+        }
+
+    def _compute_power_grid(self, Om_grid, As_grid, z_grid, k_grid,
+                            verbose: bool = True):
+        """Run CAMB for every matter-power grid point and return NumPy arrays."""
+        Pk_grid = np.zeros((len(Om_grid), len(As_grid),
+                            len(z_grid), len(k_grid)))
+        sigma8_grid = np.zeros((len(Om_grid), len(As_grid)))
 
         for i, Om in enumerate(Om_grid):
             for j, As in enumerate(As_grid):
-                # Setup CAMB for this cosmology
                 pars = camb.CAMBparams()
                 pars.set_cosmology(
                     H0=self.cosmo_fid['H0'],
                     ombh2=self.cosmo_fid['ombh2'],
-                    omch2=Om * (self.cosmo_fid['H0'] / 100) ** 2 - self.cosmo_fid['ombh2'],
+                    omch2=(Om * (self.cosmo_fid['H0'] / 100) ** 2
+                           - self.cosmo_fid['ombh2']),
                     mnu=self.cosmo_fid['mnu'],
                     omk=self.cosmo_fid['omk'],
-                    tau=self.cosmo_fid['tau']
+                    tau=self.cosmo_fid['tau'],
                 )
-
                 pars.InitPower.set_params(As=As, ns=self.cosmo_fid['ns'])
-                pars.set_matter_power(redshifts=z_grid.tolist(), kmax=10.0)
+                pars.set_matter_power(
+                    redshifts=z_grid.tolist(), kmax=K_MAX_CAMB
+                )
                 pars.NonLinear = model.NonLinear_both
 
                 results = camb.get_results(pars)
-
-                # Record resulting sigma8 at z=0 for this (Omega_m, A_s)
-                s8_camb = results.get_sigma8()[-1]
-                sigma8_grid[i, j] = s8_camb
-
-                # Get P(k) for all z
-                PK_interp = results.get_matter_power_interpolator(
+                sigma8_camb = results.get_sigma8()[-1]
+                sigma8_grid[i, j] = sigma8_camb
+                interpolator = results.get_matter_power_interpolator(
                     nonlinear=True, hubble_units=False, k_hunit=False
                 )
                 for iz, z in enumerate(z_grid):
-                    Pk_grid[i, j, iz, :] = PK_interp.P(z, k_grid)
+                    Pk_grid[i, j, iz, :] = interpolator.P(z, k_grid)
 
                 if verbose:
-                    print(f"    Computed ({i + 1}/{nOm}, {j + 1}/{nAs}): "
-                          f"Omega_m={Om:.3f}, A_s={As:.3e}, sigma_8={s8_camb:.3f}")
+                    print(f"    Computed ({i + 1}/{len(Om_grid)}, "
+                          f"{j + 1}/{len(As_grid)}): Omega_m={Om:.3f}, "
+                          f"A_s={As:.3e}, sigma_8={sigma8_camb:.3f}")
 
-        # Store grids as JAX arrays on GPU
-        self.Om_grid = jnp.array(Om_grid)
-        self.As_grid = jnp.array(As_grid)
-        self.z_grid = jnp.array(z_grid)
-        self.k_grid = jnp.array(k_grid)
-        self.Pk_grid = jnp.array(Pk_grid)
-        self.sigma8_grid = jnp.array(sigma8_grid)
+        return {
+            'Om_grid': Om_grid,
+            'As_grid': As_grid,
+            'z_grid': z_grid,
+            'k_grid': k_grid,
+            'Pk_grid': Pk_grid,
+            'sigma8_grid': sigma8_grid,
+        }
 
-        if verbose:
-            print("  P(k) grid ready on GPU!")
-            print("  sigma_8 mapping stored for each (Omega_m, A_s) grid point")
-
-        # Also setup background cosmology interpolators
-        self._setup_background(Om_grid, verbose=verbose)
+    @staticmethod
+    def _validate_power_grid_arrays(arrays, nOm, nAs, nz, nk):
+        """Fail loudly if a cache entry is incomplete or dimensionally wrong."""
+        expected_shapes = {
+            'Om_grid': (nOm,),
+            'As_grid': (nAs,),
+            'z_grid': (nz,),
+            'k_grid': (nk,),
+            'Pk_grid': (nOm, nAs, nz, nk),
+            'sigma8_grid': (nOm, nAs),
+        }
+        for name, expected_shape in expected_shapes.items():
+            if name not in arrays:
+                raise CambCacheCorruptionError(
+                    f"CAMB matter-power cache is missing {name!r}"
+                )
+            if arrays[name].shape != expected_shape:
+                raise CambCacheCorruptionError(
+                    f"CAMB matter-power cache array {name!r} has shape "
+                    f"{arrays[name].shape}; expected {expected_shape}"
+                )
 
     def _setup_background(self, Om_grid, verbose: bool = True,
                           n_Om_min: int = 101):
-        """Setup background cosmology table chi(z) over Omega_m grid.
-
-        Uses a denser Omega_m grid than the P(k) grid: background CAMB calls
-        are cheap, and the kernel geometry tables (and their autodiff
-        Om-derivatives) inherit this grid's resolution. Autodiff returns the
-        local slope of the piecewise-linear interpolation, so the grid spacing
-        directly sets the noise level of dD/dOm; 101 points over the default
-        Om range keeps this at the few-percent level.
-        """
+        """Set up the cached background distance table over Omega_m."""
         n_Om = max(len(Om_grid), n_Om_min)
         Om_grid = np.linspace(Om_grid[0], Om_grid[-1], n_Om)
+        z_grid = np.linspace(0, 7, 500)
 
-        z_arr = np.linspace(0, 7, 500)
-        chi_table = np.zeros((len(Om_grid), len(z_arr)))
+        configuration = self._background_cache_configuration(Om_grid, z_grid)
+        arrays, cache_hit = self.camb_cache.get_or_compute(
+            configuration,
+            lambda: self._compute_background_grid(Om_grid, z_grid),
+        )
+        self._validate_background_arrays(
+            arrays, nOm=len(Om_grid), nz=len(z_grid)
+        )
 
+        self.z_bg = jnp.array(arrays['z_bg'])
+        self.Om_bg = jnp.array(arrays['Om_bg'])
+        self.chi_bg_table = jnp.array(arrays['chi_bg_table'])
+
+        if verbose:
+            source = "persistent cache" if cache_hit else "new CAMB calculations"
+            print(f"Background cosmology table ready on GPU ({source})")
+            print(f"  Cache entry: {self.camb_cache.path_for(configuration)}")
+
+    def _background_cache_configuration(self, Om_grid, z_grid):
+        """Complete scientific/numerical identity of the distance table."""
+        return {
+            'product': 'background_distance_grid',
+            'product_version': CAMB_BACKGROUND_GRID_PRODUCT_VERSION,
+            'camb_version': getattr(camb, '__version__', 'unknown'),
+            'cosmology': {
+                'H0': self.cosmo_fid['H0'],
+                'ombh2': self.cosmo_fid['ombh2'],
+                'mnu': self.cosmo_fid['mnu'],
+                'omk': self.cosmo_fid['omk'],
+                'dark_energy': 'CAMB_default_LambdaCDM',
+            },
+            'Om_grid': Om_grid,
+            'z_grid': z_grid,
+        }
+
+    def _compute_background_grid(self, Om_grid, z_grid):
+        """Run CAMB for the background-distance grid and return NumPy arrays."""
+        chi_table = np.zeros((len(Om_grid), len(z_grid)))
         for i, Om in enumerate(Om_grid):
             pars = camb.CAMBparams()
             pars.set_cosmology(
                 H0=self.cosmo_fid['H0'],
                 ombh2=self.cosmo_fid['ombh2'],
-                omch2=Om * (self.cosmo_fid['H0'] / 100) ** 2 - self.cosmo_fid['ombh2'],
+                omch2=(Om * (self.cosmo_fid['H0'] / 100) ** 2
+                       - self.cosmo_fid['ombh2']),
                 mnu=self.cosmo_fid['mnu'],
                 omk=self.cosmo_fid['omk'],
             )
-            bg = camb.get_background(pars)
-            chi_table[i, :] = bg.comoving_radial_distance(z_arr)
+            background = camb.get_background(pars)
+            chi_table[i, :] = background.comoving_radial_distance(z_grid)
 
-        self.z_bg = jnp.array(z_arr)
-        self.Om_bg = jnp.array(Om_grid)
-        self.chi_bg_table = jnp.array(chi_table)
+        return {
+            'z_bg': z_grid,
+            'Om_bg': Om_grid,
+            'chi_bg_table': chi_table,
+        }
 
-        if verbose:
-            print("Background cosmology table ready on GPU")
+    @staticmethod
+    def _validate_background_arrays(arrays, nOm, nz):
+        """Fail loudly if a cached distance table has invalid dimensions."""
+        expected_shapes = {
+            'z_bg': (nz,),
+            'Om_bg': (nOm,),
+            'chi_bg_table': (nOm, nz),
+        }
+        for name, expected_shape in expected_shapes.items():
+            if name not in arrays:
+                raise CambCacheCorruptionError(
+                    f"CAMB background cache is missing {name!r}"
+                )
+            if arrays[name].shape != expected_shape:
+                raise CambCacheCorruptionError(
+                    f"CAMB background cache array {name!r} has shape "
+                    f"{arrays[name].shape}; expected {expected_shape}"
+                )
 
     @partial(jit, static_argnums=(0,))
     def chi_of_z(self, Om, z):
