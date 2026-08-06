@@ -457,6 +457,13 @@ class TheoryJAX:
 
         w0_fid = float(self.cosmo_fid['w0'])
         wa_fid = float(self.cosmo_fid['wa'])
+        if not (np.isclose(w0_fid, -1.0) and np.isclose(wa_fid, 0.0)):
+            raise NotImplementedError(
+                "The current Omega_m--sigma8 baseline grids are centred on "
+                "LambdaCDM (w0=-1, wa=0); a different dark-energy fiducial "
+                "would require rebuilding those baseline grids with the "
+                "same fiducial model"
+            )
         target_sigma8 = float(self.cosmo_fid['sigma8'])
         z_grid = np.asarray(self.z_grid)
         k_grid = np.asarray(self.k_grid)
@@ -668,87 +675,157 @@ class TheoryJAX:
                 f"match target {target_sigma8}"
             )
 
+    def _dark_energy_values(self, w0, wa):
+        """Resolve optional CPL parameters to the configured fiducial point."""
+        if w0 is None:
+            w0 = self.cosmo_fid['w0']
+        if wa is None:
+            wa = self.cosmo_fid['wa']
+        return w0, wa
+
     @partial(jit, static_argnums=(0,))
-    def chi_of_z(self, Om, z):
-        """Comoving distance (Mpc) as function of redshift with Omega_m dependence."""
-        iOm = (Om - self.Om_bg[0]) / (self.Om_bg[-1] - self.Om_bg[0]) * (len(self.Om_bg) - 1)
+    def _chi_row(self, Om, w0=None, wa=None):
+        """Distance row with local fixed-sigma8 w0/wa responses applied."""
+        iOm = ((Om - self.Om_bg[0]) / (self.Om_bg[-1] - self.Om_bg[0])
+               * (len(self.Om_bg) - 1))
         iOm = jnp.clip(iOm, 0.0, len(self.Om_bg) - 1.001)
         Om_low = jnp.floor(iOm).astype(int)
         Om_high = jnp.minimum(Om_low + 1, len(self.Om_bg) - 1)
         t_Om = iOm - Om_low
-        chi_row = (1.0 - t_Om) * self.chi_bg_table[Om_low, :] + t_Om * self.chi_bg_table[Om_high, :]
-        return jnp.interp(z, self.z_bg, chi_row)
+        chi_row = ((1.0 - t_Om) * self.chi_bg_table[Om_low, :]
+                   + t_Om * self.chi_bg_table[Om_high, :])
+
+        requested = w0 is not None or wa is not None
+        if not hasattr(self, 'dchi_dw0'):
+            if requested:
+                raise RuntimeError(
+                    "Dark-energy responses are unavailable; call "
+                    "setup_dark_energy_responses() first"
+                )
+            return chi_row
+
+        w0, wa = self._dark_energy_values(w0, wa)
+        return (chi_row
+                + (w0 - self.cosmo_fid['w0']) * self.dchi_dw0
+                + (wa - self.cosmo_fid['wa']) * self.dchi_dwa)
 
     @partial(jit, static_argnums=(0,))
-    def z_of_chi(self, Om, chi):
-        """Redshift as function of comoving distance with Omega_m dependence."""
-        iOm = (Om - self.Om_bg[0]) / (self.Om_bg[-1] - self.Om_bg[0]) * (len(self.Om_bg) - 1)
-        iOm = jnp.clip(iOm, 0.0, len(self.Om_bg) - 1.001)
-        Om_low = jnp.floor(iOm).astype(int)
-        Om_high = jnp.minimum(Om_low + 1, len(self.Om_bg) - 1)
-        t_Om = iOm - Om_low
-        chi_row = (1.0 - t_Om) * self.chi_bg_table[Om_low, :] + t_Om * self.chi_bg_table[Om_high, :]
-        return jnp.interp(chi, chi_row, self.z_bg)
+    def chi_of_z(self, Om, z, w0=None, wa=None):
+        """Comoving distance including local Omega_m, w0 and wa responses."""
+        return jnp.interp(z, self.z_bg, self._chi_row(Om, w0, wa))
 
     @partial(jit, static_argnums=(0,))
-    def Pk_interp(self, Om, s8, z, k):
-        """
-        Interpolate P(k) from pre-computed grid - JAX multilinear interpolation.
+    def z_of_chi(self, Om, chi, w0=None, wa=None):
+        """Inverse distance relation including local w0/wa geometry."""
+        return jnp.interp(chi, self._chi_row(Om, w0, wa), self.z_bg)
 
-        k beyond the grid is power-law extrapolated (linear continuation in
-        log P vs log k, matching loscov's extrap_kmax behaviour). Clamping to
-        the edge value instead injects spurious non-decaying small-scale power
-        into high-ell C_ells, which swamps the correlation functions at large
-        theta. z and (Om, s8) outside the grid still clamp to the edge.
-
-        Args:
-            Om, s8: Cosmological parameters
-            z, k: Redshift and wavenumber
-        """
+    @partial(jit, static_argnums=(0,))
+    def _dark_energy_response_interp(self, table, z, k):
+        """Interpolate a dlnP/dw table, continuing linearly in log(k)."""
         from jax.scipy.ndimage import map_coordinates
 
-        # Normalize Omega_m grid coordinate [0, nOm-1]
-        iOm = (Om - self.Om_grid[0]) / (self.Om_grid[-1] - self.Om_grid[0]) * (len(self.Om_grid) - 1)
-        iOm = jnp.clip(iOm, 0.0, len(self.Om_grid) - 1.001)
-
-        # Interpolate sigma8(Om, A_s) along the A_s axis to find the matching A_s index
-        Om_low = jnp.floor(iOm).astype(int)
-        Om_high = jnp.minimum(Om_low + 1, len(self.Om_grid) - 1)
-        t_Om = iOm - Om_low
-
-        sigma8_row = (1.0 - t_Om) * self.sigma8_grid[Om_low, :] + t_Om * self.sigma8_grid[Om_high, :]
-
-        a_indices = jnp.arange(len(self.As_grid))
-        iAs = jnp.interp(s8, sigma8_row, a_indices)
-        iAs = jnp.clip(iAs, 0.0, len(self.As_grid) - 1.001)
-
-        # Remaining coordinates (z, k)
         nk = len(self.k_grid)
-        iz = (z - self.z_grid[0]) / (self.z_grid[-1] - self.z_grid[0]) * (len(self.z_grid) - 1)
-        ik_raw = jnp.log(k / self.k_grid[0]) / jnp.log(self.k_grid[-1] / self.k_grid[0]) * (nk - 1)
+        iz = ((z - self.z_grid[0]) / (self.z_grid[-1] - self.z_grid[0])
+              * (len(self.z_grid) - 1))
+        ik_raw = (jnp.log(k / self.k_grid[0])
+                  / jnp.log(self.k_grid[-1] / self.k_grid[0]) * (nk - 1))
         iz = jnp.clip(iz, 0.0, len(self.z_grid) - 1.001)
         ik = jnp.clip(ik_raw, 0.0, nk - 1.001)
 
-        def P_at(ik_val):
-            coords = jnp.array([[iOm], [iAs], [iz], [ik_val]])
-            return map_coordinates(self.Pk_grid, coords, order=1, mode='nearest')[0]
+        def response_at(ik_value):
+            coordinates = jnp.array([[iz], [ik_value]])
+            return map_coordinates(
+                table, coordinates, order=1, mode='nearest'
+            )[0]
+
+        response_in = response_at(ik)
+        i_hi = nk - 1.001
+        response_hi = (response_at(jnp.asarray(i_hi))
+                       + (response_at(jnp.asarray(i_hi))
+                          - response_at(jnp.asarray(i_hi - 1.0)))
+                       * (ik_raw - i_hi))
+        response_lo = (response_at(jnp.asarray(0.0))
+                       + (response_at(jnp.asarray(1.0))
+                          - response_at(jnp.asarray(0.0))) * ik_raw)
+        return jnp.where(ik_raw > i_hi, response_hi,
+                         jnp.where(ik_raw < 0.0, response_lo, response_in))
+
+    @partial(jit, static_argnums=(0,))
+    def Pk_interp(self, Om, s8, z, k, w0=None, wa=None):
+        """Interpolate P(k,z) and apply local fixed-sigma8 CPL responses.
+
+        The baseline retains the existing power-law continuation in log P
+        versus log k outside the CAMB grid, matching loscov's extrap_kmax
+        behaviour. Redshift and Omega_m--sigma8 coordinates still clamp to
+        their grid edges. The dark-energy response is interpolated over the
+        same z--log(k) coordinates and continued linearly in log(k), so it
+        also modifies the extrapolated spectral slope.
+
+        The existing Omega_m--sigma8 grid supplies the baseline spectrum.
+        Around the configured fiducial dark-energy model, the cached CAMB
+        stencil supplies a first-order response in log power, so positivity
+        is preserved:
+
+            P = P_base exp[Delta w0 dlnP/dw0 + Delta wa dlnP/dwa].
+
+        The response is intentionally local; Step 6 will test convergence
+        against alternative central-step sizes before science use.
+        """
+        from jax.scipy.ndimage import map_coordinates
+
+        iOm = ((Om - self.Om_grid[0]) / (self.Om_grid[-1] - self.Om_grid[0])
+               * (len(self.Om_grid) - 1))
+        iOm = jnp.clip(iOm, 0.0, len(self.Om_grid) - 1.001)
+        Om_low = jnp.floor(iOm).astype(int)
+        Om_high = jnp.minimum(Om_low + 1, len(self.Om_grid) - 1)
+        t_Om = iOm - Om_low
+        sigma8_row = ((1.0 - t_Om) * self.sigma8_grid[Om_low, :]
+                      + t_Om * self.sigma8_grid[Om_high, :])
+        iAs = jnp.interp(s8, sigma8_row, jnp.arange(len(self.As_grid)))
+        iAs = jnp.clip(iAs, 0.0, len(self.As_grid) - 1.001)
+
+        nk = len(self.k_grid)
+        iz = ((z - self.z_grid[0]) / (self.z_grid[-1] - self.z_grid[0])
+              * (len(self.z_grid) - 1))
+        ik_raw = (jnp.log(k / self.k_grid[0])
+                  / jnp.log(self.k_grid[-1] / self.k_grid[0]) * (nk - 1))
+        iz = jnp.clip(iz, 0.0, len(self.z_grid) - 1.001)
+        ik = jnp.clip(ik_raw, 0.0, nk - 1.001)
+
+        def P_at(ik_value):
+            coordinates = jnp.array([[iOm], [iAs], [iz], [ik_value]])
+            return map_coordinates(
+                self.Pk_grid, coordinates, order=1, mode='nearest'
+            )[0]
 
         P_in = P_at(ik)
-
-        # Power-law extrapolation beyond the k grid: the grid is log-spaced,
-        # so one index step is a constant step in log k, and the local
-        # log-log slope at the edge continues the spectrum.
         i_hi = nk - 1.001
         logP_hi = jnp.log(P_at(jnp.asarray(i_hi)))
         slope_hi = logP_hi - jnp.log(P_at(jnp.asarray(i_hi - 1.0)))
         P_hi = jnp.exp(logP_hi + slope_hi * (ik_raw - i_hi))
-
         logP_lo = jnp.log(P_at(jnp.asarray(0.0)))
         slope_lo = jnp.log(P_at(jnp.asarray(1.0))) - logP_lo
         P_lo = jnp.exp(logP_lo + slope_lo * ik_raw)
+        P_base = jnp.where(ik_raw > i_hi, P_hi,
+                           jnp.where(ik_raw < 0.0, P_lo, P_in))
 
-        return jnp.where(ik_raw > i_hi, P_hi,
-                         jnp.where(ik_raw < 0.0, P_lo, P_in))
+        requested = w0 is not None or wa is not None
+        if not hasattr(self, 'dlnPk_dw0'):
+            if requested:
+                raise RuntimeError(
+                    "Dark-energy responses are unavailable; call "
+                    "setup_dark_energy_responses() first"
+                )
+            return P_base
+
+        w0, wa = self._dark_energy_values(w0, wa)
+        response = (
+            (w0 - self.cosmo_fid['w0'])
+            * self._dark_energy_response_interp(self.dlnPk_dw0, z, k)
+            + (wa - self.cosmo_fid['wa'])
+            * self._dark_energy_response_interp(self.dlnPk_dwa, z, k)
+        )
+        return P_base * jnp.exp(response)
 
     def setup_galaxy_distributions(self, data_dir: str, verbose: bool = True):
         """
@@ -836,84 +913,149 @@ class TheoryJAX:
     def _precompute_QL_mean(self, chi_min: float = CHI_MIN_DEFAULT,
                             chi_max: float = CHI_MAX_QL_GRID,
                             nchi: int = N_CHI_QL, verbose: bool = True):
-        """Pre-compute mean LOS geometry kernel K_LOS(chi), averaged over lenses.
-
-        Tabulated on the Omega_m grid so the geometric response (lens/source
-        distances shifting with cosmology) survives autodiff; a single
-        fiducial-Om table would freeze dK/dOm to zero and bias the Fisher
-        derivatives.
-        """
+        """Pre-compute LOS geometry and, when available, its CPL response."""
         chi_grid_np = np.linspace(chi_min, chi_max, nchi)
         Om_grid_np = np.array(self.Om_bg)
         KL_mean_np = np.zeros((len(Om_grid_np), nchi))
+        use_dark_energy = hasattr(self, 'dchi_dw0')
+        if use_dark_energy:
+            dKL_dw0_np = np.zeros_like(KL_mean_np)
+            dKL_dwa_np = np.zeros_like(KL_mean_np)
+            z_bg_np = np.asarray(self.z_bg)
+            dchi_d_dw0 = np.interp(
+                self.z_d_array, z_bg_np, np.asarray(self.dchi_dw0))
+            dchi_s_dw0 = np.interp(
+                self.z_s_array, z_bg_np, np.asarray(self.dchi_dw0))
+            dchi_d_dwa = np.interp(
+                self.z_d_array, z_bg_np, np.asarray(self.dchi_dwa))
+            dchi_s_dwa = np.interp(
+                self.z_s_array, z_bg_np, np.asarray(self.dchi_dwa))
 
         if verbose:
             print("Pre-computing mean LOS kernel on Omega_m grid...")
 
-        chi_col = chi_grid_np[:, None]  # (nchi, 1) vs lens arrays (1, N_lenses)
-        for iOm, Om in enumerate(Om_grid_np):
-            chi_d_row = np.array(self.chi_of_z(Om, jnp.array(self.z_d_array)))[None, :]
-            chi_s_row = np.array(self.chi_of_z(Om, jnp.array(self.z_s_array)))[None, :]
-            # Strong-lensing LOS convergence weight, matching loscov
-            # (functions/correlations/LL.py): K = os + od - ds, each term
-            # active only where positive. Vanishes behind the source.
+        chi_col = chi_grid_np[:, None]
+
+        def mean_kernel(chi_d, chi_s):
+            chi_d_row = np.maximum(chi_d, 1e-6)[None, :]
+            chi_s_row = np.maximum(chi_s, 1e-6)[None, :]
             os_w = (chi_s_row - chi_col) / chi_s_row
             od_w = (chi_d_row - chi_col) / chi_d_row
             ds_w = ((chi_col - chi_d_row) * (chi_s_row - chi_col)
                     / (chi_col * (chi_s_row - chi_d_row)))
-            K_vals = (os_w * np.heaviside(os_w, 0.0)
+            values = (os_w * np.heaviside(os_w, 0.0)
                       + od_w * np.heaviside(od_w, 0.0)
                       - ds_w * np.heaviside(ds_w, 0.0))
-            KL_mean_np[iOm, :] = K_vals.mean(axis=1)
+            return values.mean(axis=1)
 
-        # Transfer to JAX/GPU
+        for iOm, Om in enumerate(Om_grid_np):
+            chi_d = np.asarray(self.chi_of_z(Om, self.z_d_array))
+            chi_s = np.asarray(self.chi_of_z(Om, self.z_s_array))
+            KL_mean_np[iOm, :] = mean_kernel(chi_d, chi_s)
+            if use_dark_energy:
+                for step, derivative_d, derivative_s, output in (
+                    (self.w0_step, dchi_d_dw0, dchi_s_dw0, dKL_dw0_np),
+                    (self.wa_step, dchi_d_dwa, dchi_s_dwa, dKL_dwa_np),
+                ):
+                    plus = mean_kernel(
+                        chi_d + step * derivative_d,
+                        chi_s + step * derivative_s,
+                    )
+                    minus = mean_kernel(
+                        chi_d - step * derivative_d,
+                        chi_s - step * derivative_s,
+                    )
+                    output[iOm, :] = (plus - minus) / (2.0 * step)
+
         self.chi_QL_grid = jnp.array(chi_grid_np)
         self.KL_mean_grid = jnp.array(KL_mean_np)
+        if use_dark_energy:
+            self.dKL_mean_dw0_grid = jnp.array(dKL_dw0_np)
+            self.dKL_mean_dwa_grid = jnp.array(dKL_dwa_np)
 
         if verbose:
+            suffix = " with w0/wa responses" if use_dark_energy else ""
             print(f"  Mean LOS kernel ready on GPU "
-                  f"({len(Om_grid_np)} Om points x {nchi} chi points)")
+                  f"({len(Om_grid_np)} Om points x {nchi} chi points){suffix}")
 
     def _precompute_QE_mean(self, chi_min: float = CHI_MIN_DEFAULT,
                             chi_max: float = CHI_MAX_QL_GRID,
                             nchi: int = N_CHI_QL, verbose: bool = True):
-        """Pre-compute mean weak-lensing geometry kernel K_E(chi) for each E bin.
-
-        Tabulated on the Omega_m grid (see _precompute_QL_mean) so that the
-        source-distance response to cosmology survives autodiff.
-        """
+        """Pre-compute shear geometry and, when available, its CPL response."""
         chi_grid_np = np.linspace(chi_min, chi_max, nchi)
         Om_grid_np = np.array(self.Om_bg)
         KE_mean_np = np.zeros((len(Om_grid_np), self.Nbinz_E, nchi))
+        use_dark_energy = hasattr(self, 'dchi_dw0')
+        if use_dark_energy:
+            dKE_dw0_np = np.zeros_like(KE_mean_np)
+            dKE_dwa_np = np.zeros_like(KE_mean_np)
 
         if verbose:
             print("Pre-computing mean E-kernels on Omega_m grid...")
 
-        z_pdf_np = np.array(self.z_pdf_grid)
-        E_pdf_np = np.array(self.E_pdf_table)
+        z_pdf_np = np.asarray(self.z_pdf_grid)
+        E_pdf_np = np.asarray(self.E_pdf_table)
         chi_col = chi_grid_np[:, None]
+        if use_dark_energy:
+            z_bg_np = np.asarray(self.z_bg)
+            dchi_source_dw0 = np.interp(
+                z_pdf_np, z_bg_np, np.asarray(self.dchi_dw0))
+            dchi_source_dwa = np.interp(
+                z_pdf_np, z_bg_np, np.asarray(self.dchi_dwa))
+
+        def kernel_matrix(chi_source):
+            chi_src_row = np.maximum(chi_source, 1e-6)[None, :]
+            return np.where(
+                chi_col < chi_src_row,
+                (chi_src_row - chi_col) / chi_src_row,
+                0.0,
+            )
 
         for iOm, Om in enumerate(Om_grid_np):
-            chi_source = np.array(self.chi_of_z(Om, jnp.array(z_pdf_np)))
-            chi_src_row = np.maximum(chi_source, 1e-6)[None, :]
-            K_matrix = np.where(chi_col < chi_src_row,
-                                (chi_src_row - chi_col) / chi_src_row, 0.0)
+            chi_source = np.asarray(self.chi_of_z(Om, z_pdf_np))
+            base_matrix = kernel_matrix(chi_source)
+            if use_dark_energy:
+                derivative_matrices = []
+                for step, derivative in (
+                    (self.w0_step, dchi_source_dw0),
+                    (self.wa_step, dchi_source_dwa),
+                ):
+                    plus = kernel_matrix(chi_source + step * derivative)
+                    minus = kernel_matrix(chi_source - step * derivative)
+                    derivative_matrices.append((plus - minus) / (2.0 * step))
 
             for b in range(self.Nbinz_E):
+                weighted_pdf = E_pdf_np[b][None, :]
                 KE_mean_np[iOm, b, :] = np.trapezoid(
-                    K_matrix * E_pdf_np[b][None, :], z_pdf_np, axis=1)
+                    base_matrix * weighted_pdf, z_pdf_np, axis=1)
+                if use_dark_energy:
+                    dKE_dw0_np[iOm, b, :] = np.trapezoid(
+                        derivative_matrices[0] * weighted_pdf,
+                        z_pdf_np,
+                        axis=1,
+                    )
+                    dKE_dwa_np[iOm, b, :] = np.trapezoid(
+                        derivative_matrices[1] * weighted_pdf,
+                        z_pdf_np,
+                        axis=1,
+                    )
 
         self.chi_QE_grid = jnp.array(chi_grid_np)
         self.KE_mean_grid = jnp.array(KE_mean_np)
+        if use_dark_energy:
+            self.dKE_mean_dw0_grid = jnp.array(dKE_dw0_np)
+            self.dKE_mean_dwa_grid = jnp.array(dKE_dwa_np)
 
         if verbose:
+            suffix = " with w0/wa responses" if use_dark_energy else ""
             print(f"  Mean E-kernels ready on GPU ({len(Om_grid_np)} Om points, "
-                  f"{self.Nbinz_E} bins, {nchi} chi points)")
+                  f"{self.Nbinz_E} bins, {nchi} chi points){suffix}")
 
     @partial(jit, static_argnums=(0,))
     def _Om_interp_row(self, table, Om):
         """Linear interpolation of a table's leading Omega_m axis."""
-        iOm = (Om - self.Om_bg[0]) / (self.Om_bg[-1] - self.Om_bg[0]) * (len(self.Om_bg) - 1)
+        iOm = ((Om - self.Om_bg[0]) / (self.Om_bg[-1] - self.Om_bg[0])
+               * (len(self.Om_bg) - 1))
         iOm = jnp.clip(iOm, 0.0, len(self.Om_bg) - 1.001)
         Om_low = jnp.floor(iOm).astype(int)
         Om_high = jnp.minimum(Om_low + 1, len(self.Om_bg) - 1)
@@ -921,12 +1063,28 @@ class TheoryJAX:
         return (1.0 - t_Om) * table[Om_low] + t_Om * table[Om_high]
 
     @partial(jit, static_argnums=(0,))
-    def QL_mean(self, chi, Om):
-        """Mean LOS lensing kernel with Omega_m-dependent geometry."""
+    def QL_mean(self, chi, Om, w0=None, wa=None):
+        """Mean LOS lensing kernel with Omega_m and CPL geometry."""
         K_row = self._Om_interp_row(self.KL_mean_grid, Om)
+        requested = w0 is not None or wa is not None
+        if requested and not hasattr(self, 'dKL_mean_dw0_grid'):
+            raise RuntimeError(
+                "Dark-energy kernel responses are unavailable; run galaxy "
+                "setup after setup_dark_energy_responses()"
+            )
+        if hasattr(self, 'dKL_mean_dw0_grid'):
+            w0, wa = self._dark_energy_values(w0, wa)
+            K_row = (
+                K_row
+                + (w0 - self.cosmo_fid['w0'])
+                * self._Om_interp_row(self.dKL_mean_dw0_grid, Om)
+                + (wa - self.cosmo_fid['wa'])
+                * self._Om_interp_row(self.dKL_mean_dwa_grid, Om)
+            )
         K = jnp.interp(chi, self.chi_QL_grid, K_row)
-        z = self.z_of_chi(Om, chi)
-        prefactor = -(3.0 / 2.0) * Om * (self.cosmo_fid['H0'] ** 2) / (self.c_km_s ** 2)
+        z = self.z_of_chi(Om, chi, w0, wa)
+        prefactor = (-(3.0 / 2.0) * Om * self.cosmo_fid['H0'] ** 2
+                     / self.c_km_s ** 2)
         return prefactor * (1 + z) * K
 
     @partial(jit, static_argnums=(0,))
@@ -935,34 +1093,66 @@ class TheoryJAX:
         return 1.1 * z ** 2.4 / (1 + z) + 0.9
 
     @partial(jit, static_argnums=(0,))
-    def QE_mean(self, Om, chi, bin_idx):
-        """Mean Q_E kernel averaged over source redshift distribution in one E bin."""
-        K_table = jnp.take(self.KE_mean_grid, bin_idx, axis=1)  # (nOm, nchi)
+    def QE_mean(self, Om, chi, bin_idx, w0=None, wa=None):
+        """Mean shear kernel with local CPL source-geometry response."""
+        K_table = jnp.take(self.KE_mean_grid, bin_idx, axis=1)
         K_row = self._Om_interp_row(K_table, Om)
+        requested = w0 is not None or wa is not None
+        if requested and not hasattr(self, 'dKE_mean_dw0_grid'):
+            raise RuntimeError(
+                "Dark-energy kernel responses are unavailable; run galaxy "
+                "setup after setup_dark_energy_responses()"
+            )
+        if hasattr(self, 'dKE_mean_dw0_grid'):
+            w0, wa = self._dark_energy_values(w0, wa)
+            dK_dw0 = jnp.take(self.dKE_mean_dw0_grid, bin_idx, axis=1)
+            dK_dwa = jnp.take(self.dKE_mean_dwa_grid, bin_idx, axis=1)
+            K_row = (
+                K_row
+                + (w0 - self.cosmo_fid['w0'])
+                * self._Om_interp_row(dK_dw0, Om)
+                + (wa - self.cosmo_fid['wa'])
+                * self._Om_interp_row(dK_dwa, Om)
+            )
         K = jnp.interp(chi, self.chi_QE_grid, K_row)
-        z = self.z_of_chi(Om, chi)
-        prefactor = -(3.0 / 2.0) * Om * (self.cosmo_fid['H0'] ** 2) / (self.c_km_s ** 2)
+        z = self.z_of_chi(Om, chi, w0, wa)
+        prefactor = (-(3.0 / 2.0) * Om * self.cosmo_fid['H0'] ** 2
+                     / self.c_km_s ** 2)
         return prefactor * (1 + z) * K
 
     @partial(jit, static_argnums=(0,))
-    def QP_mean(self, Om, chi, bin_idx):
-        """Mean Q_P kernel for one P tomographic bin."""
-        z = self.z_of_chi(Om, chi)
-        pz = jnp.interp(z, self.z_pdf_grid, self.P_pdf_table[bin_idx], left=0.0, right=0.0)
-        Ez = jnp.sqrt(jnp.maximum(Om * (1 + z) ** 3 + (1.0 - Om), 1e-12))
-        H_over_c = (self.cosmo_fid['H0'] / self.c_km_s) * Ez
-        return H_over_c * pz * self.galaxy_bias(z) / jnp.maximum(chi, 1e-6)
+    def QP_mean(self, Om, chi, bin_idx, w0=None, wa=None):
+        """Position kernel using the CPL expansion rate and distance map."""
+        z = self.z_of_chi(Om, chi, w0, wa)
+        pz = jnp.interp(
+            z, self.z_pdf_grid, self.P_pdf_table[bin_idx],
+            left=0.0, right=0.0,
+        )
+        w0, wa = self._dark_energy_values(w0, wa)
+        one_plus_z = 1.0 + z
+        dark_energy = ((1.0 - Om)
+                       * one_plus_z ** (3.0 * (1.0 + w0 + wa))
+                       * jnp.exp(-3.0 * wa * z / one_plus_z))
+        Ez = jnp.sqrt(jnp.maximum(
+            Om * one_plus_z ** 3 + dark_energy, 1e-12
+        ))
+        H_over_c = self.cosmo_fid['H0'] / self.c_km_s * Ez
+        return (H_over_c * pz * self.galaxy_bias(z)
+                / jnp.maximum(chi, 1e-6))
 
     @partial(jit, static_argnums=(0,))
     def compute_Cl_LL_jax(self, Om, s8, ell, chi_min=CHI_MIN_DEFAULT,
-                          chi_max=CHI_MAX_DEFAULT, nchi=N_CHI_CL):
+                          chi_max=CHI_MAX_DEFAULT, nchi=N_CHI_CL,
+                          w0=None, wa=None):
         """Compute C_ell^LL using JAX - fully differentiable."""
         chi_grid = jnp.linspace(chi_min, chi_max, nchi)
-        z_grid = self.z_of_chi(Om, chi_grid)
+        z_grid = self.z_of_chi(Om, chi_grid, w0, wa)
         k_grid = (ell + 0.5) / chi_grid
 
-        QL = self.QL_mean(chi_grid, Om)
-        Pk = vmap(lambda z, k: self.Pk_interp(Om, s8, z, k))(z_grid, k_grid)
+        QL = self.QL_mean(chi_grid, Om, w0, wa)
+        Pk = vmap(
+            lambda z, k: self.Pk_interp(Om, s8, z, k, w0, wa)
+        )(z_grid, k_grid)
 
         integrand = QL * QL * Pk
         Cl = jnp.trapezoid(integrand, chi_grid)
@@ -971,15 +1161,18 @@ class TheoryJAX:
 
     @partial(jit, static_argnums=(0,))
     def compute_Cl_LE_jax(self, Om, s8, ell, bin_idx, chi_min=CHI_MIN_DEFAULT,
-                          chi_max=CHI_MAX_DEFAULT, nchi=N_CHI_CL):
+                          chi_max=CHI_MAX_DEFAULT, nchi=N_CHI_CL,
+                          w0=None, wa=None):
         """Compute C_ell^LE using mean Q_L and distribution-averaged Q_E kernels."""
         chi_grid = jnp.linspace(chi_min, chi_max, nchi)
-        z_grid = self.z_of_chi(Om, chi_grid)
+        z_grid = self.z_of_chi(Om, chi_grid, w0, wa)
         k_grid = (ell + 0.5) / chi_grid
 
-        QL = self.QL_mean(chi_grid, Om)
-        QE = self.QE_mean(Om, chi_grid, bin_idx)
-        Pk = vmap(lambda z, k: self.Pk_interp(Om, s8, z, k))(z_grid, k_grid)
+        QL = self.QL_mean(chi_grid, Om, w0, wa)
+        QE = self.QE_mean(Om, chi_grid, bin_idx, w0, wa)
+        Pk = vmap(
+            lambda z, k: self.Pk_interp(Om, s8, z, k, w0, wa)
+        )(z_grid, k_grid)
 
         integrand = QL * QE * Pk
         Cl = jnp.trapezoid(integrand, chi_grid)
@@ -988,15 +1181,18 @@ class TheoryJAX:
 
     @partial(jit, static_argnums=(0,))
     def compute_Cl_LP_jax(self, Om, s8, ell, bin_idx, chi_min=CHI_MIN_DEFAULT,
-                          chi_max=CHI_MAX_DEFAULT, nchi=N_CHI_CL):
+                          chi_max=CHI_MAX_DEFAULT, nchi=N_CHI_CL,
+                          w0=None, wa=None):
         """Compute C_ell^LP using mean Q_L and distribution-averaged Q_P kernels."""
         chi_grid = jnp.linspace(chi_min, chi_max, nchi)
-        z_grid = self.z_of_chi(Om, chi_grid)
+        z_grid = self.z_of_chi(Om, chi_grid, w0, wa)
         k_grid = (ell + 0.5) / chi_grid
 
-        QL = self.QL_mean(chi_grid, Om)
-        QP = self.QP_mean(Om, chi_grid, bin_idx)
-        Pk = vmap(lambda z, k: self.Pk_interp(Om, s8, z, k))(z_grid, k_grid)
+        QL = self.QL_mean(chi_grid, Om, w0, wa)
+        QP = self.QP_mean(Om, chi_grid, bin_idx, w0, wa)
+        Pk = vmap(
+            lambda z, k: self.Pk_interp(Om, s8, z, k, w0, wa)
+        )(z_grid, k_grid)
 
         integrand = QL * QP * Pk
         Cl = jnp.trapezoid(integrand, chi_grid)
@@ -1005,7 +1201,8 @@ class TheoryJAX:
 
     @partial(jit, static_argnums=(0,))
     def compute_Cl_EE_jax(self, Om, s8, ell, bin_i, bin_j, chi_min=CHI_MIN_DEFAULT,
-                          chi_max=CHI_MAX_DEFAULT, nchi=N_CHI_CL):
+                          chi_max=CHI_MAX_DEFAULT, nchi=N_CHI_CL,
+                          w0=None, wa=None):
         """
         Compute C_ell^EE - cosmic shear correlation between E bins i and j.
 
@@ -1014,12 +1211,14 @@ class TheoryJAX:
         the auto-bin spectra.
         """
         chi_grid = jnp.linspace(chi_min, chi_max, nchi)
-        z_grid = self.z_of_chi(Om, chi_grid)
+        z_grid = self.z_of_chi(Om, chi_grid, w0, wa)
         k_grid = (ell + 0.5) / chi_grid
 
-        QE_i = self.QE_mean(Om, chi_grid, bin_i)
-        QE_j = self.QE_mean(Om, chi_grid, bin_j)
-        Pk = vmap(lambda z, k: self.Pk_interp(Om, s8, z, k))(z_grid, k_grid)
+        QE_i = self.QE_mean(Om, chi_grid, bin_i, w0, wa)
+        QE_j = self.QE_mean(Om, chi_grid, bin_j, w0, wa)
+        Pk = vmap(
+            lambda z, k: self.Pk_interp(Om, s8, z, k, w0, wa)
+        )(z_grid, k_grid)
 
         integrand = QE_i * QE_j * Pk
         Cl = jnp.trapezoid(integrand, chi_grid)
@@ -1028,7 +1227,8 @@ class TheoryJAX:
 
     @partial(jit, static_argnums=(0,))
     def compute_Cl_EP_jax(self, Om, s8, ell, bin_e, bin_p, chi_min=CHI_MIN_DEFAULT,
-                          chi_max=CHI_MAX_DEFAULT, nchi=N_CHI_CL):
+                          chi_max=CHI_MAX_DEFAULT, nchi=N_CHI_CL,
+                          w0=None, wa=None):
         """
         Compute C_ell^EP - shear (E bin) × position (P bin) cross-correlation.
 
@@ -1037,30 +1237,35 @@ class TheoryJAX:
         data vector stores exactly those.
         """
         chi_grid = jnp.linspace(chi_min, chi_max, nchi)
-        z_grid = self.z_of_chi(Om, chi_grid)
+        z_grid = self.z_of_chi(Om, chi_grid, w0, wa)
         k_grid = (ell + 0.5) / chi_grid
 
-        QE = self.QE_mean(Om, chi_grid, bin_e)
-        QP = self.QP_mean(Om, chi_grid, bin_p)
-        Pk = vmap(lambda z, k: self.Pk_interp(Om, s8, z, k))(z_grid, k_grid)
+        QE = self.QE_mean(Om, chi_grid, bin_e, w0, wa)
+        QP = self.QP_mean(Om, chi_grid, bin_p, w0, wa)
+        Pk = vmap(
+            lambda z, k: self.Pk_interp(Om, s8, z, k, w0, wa)
+        )(z_grid, k_grid)
         Cl = jnp.trapezoid(QE * QP * Pk, chi_grid)
 
         return Cl
 
     @partial(jit, static_argnums=(0,))
     def compute_Cl_PP_jax(self, Om, s8, ell, bin_idx, chi_min=CHI_MIN_DEFAULT,
-                          chi_max=CHI_MAX_DEFAULT, nchi=N_CHI_CL):
+                          chi_max=CHI_MAX_DEFAULT, nchi=N_CHI_CL,
+                          w0=None, wa=None):
         """
         Compute C_ell^PP - galaxy clustering auto-correlation.
 
         Uses distribution-averaged Q_P × Q_P kernels.
         """
         chi_grid = jnp.linspace(chi_min, chi_max, nchi)
-        z_grid = self.z_of_chi(Om, chi_grid)
+        z_grid = self.z_of_chi(Om, chi_grid, w0, wa)
         k_grid = (ell + 0.5) / chi_grid
 
-        QP = self.QP_mean(Om, chi_grid, bin_idx)
-        Pk = vmap(lambda z, k: self.Pk_interp(Om, s8, z, k))(z_grid, k_grid)
+        QP = self.QP_mean(Om, chi_grid, bin_idx, w0, wa)
+        Pk = vmap(
+            lambda z, k: self.Pk_interp(Om, s8, z, k, w0, wa)
+        )(z_grid, k_grid)
         Cl = jnp.trapezoid(QP * QP * Pk, chi_grid)
         return Cl
 
@@ -1405,7 +1610,7 @@ class TheoryJAX:
             sizes['PP'] = sum(w.shape[0] for w in self.w_PP)
         return sizes
 
-    def predict_data_vector_jax(self, Om, s8, ell_grid=None):
+    def predict_data_vector_jax(self, Om, s8, ell_grid=None, w0=None, wa=None):
         """
         Generate theory predictions for given cosmology using JAX.
 
@@ -1415,10 +1620,19 @@ class TheoryJAX:
             Om: Omega_m value
             s8: sigma_8 value
             ell_grid: Multipoles for Hankel transform (if None, use default)
+            w0, wa: CPL dark-energy parameters. Passing either requires
+                setup_dark_energy_responses() before galaxy setup.
 
         Returns:
             Flat array of predictions, shape (n_data,)
         """
+        if ((w0 is not None or wa is not None)
+                and not hasattr(self, 'dlnPk_dw0')):
+            raise RuntimeError(
+                "Dark-energy responses are unavailable; call "
+                "setup_dark_energy_responses() before galaxy setup"
+            )
+
         if ell_grid is None:
             ell_grid = jnp.logspace(np.log10(ELL_MIN_DEFAULT), np.log10(ELL_MAX_DEFAULT), N_ELL_DEFAULT)
 
@@ -1435,7 +1649,9 @@ class TheoryJAX:
         # entries in the first n_minus slots, giving uniform per-bin SNR.
 
         # LL predictions
-        Cl_LL_vals = vmap(lambda ell: self.compute_Cl_LL_jax(Om, s8, ell))(ell_grid)
+        Cl_LL_vals = vmap(
+            lambda ell: self.compute_Cl_LL_jax(
+                Om, s8, ell, w0=w0, wa=wa))(ell_grid)
 
         xi_LL_plus = self._bin_average(
             self.hankel_j0(Cl_LL_vals, ell_grid, self.nodes_LL_plus), self.w_LL_plus)
@@ -1449,7 +1665,9 @@ class TheoryJAX:
 
         # LE predictions
         for bin_idx in range(n_e_bins):
-            Cl_LE_vals = vmap(lambda ell: self.compute_Cl_LE_jax(Om, s8, ell, bin_idx))(ell_grid)
+            Cl_LE_vals = vmap(
+                lambda ell: self.compute_Cl_LE_jax(
+                    Om, s8, ell, bin_idx, w0=w0, wa=wa))(ell_grid)
 
             xi_LE_plus = self._bin_average(
                 self.hankel_j0(Cl_LE_vals, ell_grid, self.nodes_LE_plus[bin_idx]),
@@ -1462,7 +1680,9 @@ class TheoryJAX:
 
         # LP predictions
         for bin_idx in range(n_p_bins):
-            Cl_LP_vals = vmap(lambda ell: self.compute_Cl_LP_jax(Om, s8, ell, bin_idx))(ell_grid)
+            Cl_LP_vals = vmap(
+                lambda ell: self.compute_Cl_LP_jax(
+                    Om, s8, ell, bin_idx, w0=w0, wa=wa))(ell_grid)
 
             xi_LP = self._bin_average(
                 self.hankel_j2(Cl_LP_vals, ell_grid, self.nodes_LP[bin_idx]),
@@ -1474,7 +1694,8 @@ class TheoryJAX:
         if 'EE' in self.probes:
             for k, (i, j) in enumerate(self.ee_pairs):
                 Cl_EE_vals = vmap(
-                    lambda ell: self.compute_Cl_EE_jax(Om, s8, ell, i, j))(ell_grid)
+                    lambda ell: self.compute_Cl_EE_jax(
+                        Om, s8, ell, i, j, w0=w0, wa=wa))(ell_grid)
 
                 xi_EE_plus = self._bin_average(
                     self.hankel_j0(Cl_EE_vals, ell_grid, self.nodes_EE_plus[k]),
@@ -1489,7 +1710,8 @@ class TheoryJAX:
         if 'EP' in self.probes:
             for k, (i, j) in enumerate(self.ep_pairs):
                 Cl_EP_vals = vmap(
-                    lambda ell: self.compute_Cl_EP_jax(Om, s8, ell, i, j))(ell_grid)
+                    lambda ell: self.compute_Cl_EP_jax(
+                        Om, s8, ell, i, j, w0=w0, wa=wa))(ell_grid)
 
                 xi_EP = self._bin_average(
                     self.hankel_j2(Cl_EP_vals, ell_grid, self.nodes_EP[k]),
@@ -1502,7 +1724,8 @@ class TheoryJAX:
         if 'PP' in self.probes:
             for k, b in enumerate(self.pp_bins):
                 Cl_PP_vals = vmap(
-                    lambda ell: self.compute_Cl_PP_jax(Om, s8, ell, b))(ell_grid)
+                    lambda ell: self.compute_Cl_PP_jax(
+                        Om, s8, ell, b, w0=w0, wa=wa))(ell_grid)
 
                 xi_PP = self._bin_average(
                     self.hankel_j0(Cl_PP_vals, ell_grid, self.nodes_PP[k]),
@@ -1511,17 +1734,34 @@ class TheoryJAX:
 
         return jnp.concatenate(predictions_parts)
 
-    def predict_data_vector_batched(self, Om_batch, s8_batch, ell_grid=None):
-        """
-        Generate theory predictions for multiple cosmologies in parallel.
+    def predict_data_vector_batched(
+            self, Om_batch, s8_batch, ell_grid=None,
+            w0_batch=None, wa_batch=None):
+        """Generate theory predictions for multiple cosmologies in parallel.
 
-        Args:
-            Om_batch: Array of Omega_m values, shape (N,)
-            s8_batch: Array of sigma_8 values, shape (N,)
-            ell_grid: Multipoles for Hankel transform
-
-        Returns:
-            Array of predictions, shape (N, n_data)
+        Optional w0/wa batches activate the cached local dark-energy response;
+        omitted batches retain the existing Omega_m--sigma8 behaviour.
         """
-        predict_fn = vmap(lambda Om, s8: self.predict_data_vector_jax(Om, s8, ell_grid))
-        return predict_fn(Om_batch, s8_batch)
+        if w0_batch is None and wa_batch is None:
+            predict_fn = vmap(
+                lambda Om, s8: self.predict_data_vector_jax(
+                    Om, s8, ell_grid
+                )
+            )
+            return predict_fn(Om_batch, s8_batch)
+
+        if not hasattr(self, 'dlnPk_dw0'):
+            raise RuntimeError(
+                "Dark-energy responses are unavailable; call "
+                "setup_dark_energy_responses() before galaxy setup"
+            )
+        if w0_batch is None:
+            w0_batch = jnp.full_like(Om_batch, self.cosmo_fid['w0'])
+        if wa_batch is None:
+            wa_batch = jnp.full_like(Om_batch, self.cosmo_fid['wa'])
+        predict_fn = vmap(
+            lambda Om, s8, w0, wa: self.predict_data_vector_jax(
+                Om, s8, ell_grid, w0, wa
+            )
+        )
+        return predict_fn(Om_batch, s8_batch, w0_batch, wa_batch)
