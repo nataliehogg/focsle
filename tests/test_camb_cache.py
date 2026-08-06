@@ -85,6 +85,11 @@ def _bare_theory_with_cache(tmp_path):
         'omk': 0.0,
         'tau': 0.054,
         'ns': 0.965,
+        'As': 2.0e-9,
+        'Omega_m': 0.3138,
+        'sigma8': 0.7913,
+        'w0': -1.0,
+        'wa': 0.0,
     }
     theory.camb_cache = CambArrayCache(tmp_path)
     return theory
@@ -140,3 +145,57 @@ def test_background_setup_reuses_persistent_cache(tmp_path):
 
     assert calls == 1
     assert np.asarray(theory.chi_bg_table).shape == (3, 500)
+
+
+def test_dark_energy_stencil_is_cached_per_cosmology(tmp_path):
+    theory = _bare_theory_with_cache(tmp_path)
+    theory.z_grid = np.array([0.0, 1.0])
+    theory.k_grid = np.array([0.01, 0.1, 1.0])
+    theory.z_bg = np.array([0.0, 0.5, 1.0])
+    calls = 0
+
+    def fake_compute(w0, wa, target_sigma8, z_grid, k_grid, z_background):
+        nonlocal calls
+        calls += 1
+        return {
+            'Pk': np.full((len(z_grid), len(k_grid)),
+                          np.exp(2.0 * w0 + 3.0 * wa)),
+            'chi': np.full(len(z_background), 100.0 + 5.0 * w0 + 7.0 * wa),
+            'As': np.asarray(2.0e-9),
+            'sigma8': np.asarray(target_sigma8),
+        }
+
+    theory._compute_dark_energy_point = fake_compute
+    theory.setup_dark_energy_responses(
+        w0_step=0.05, wa_step=0.1, verbose=False
+    )
+    theory.setup_dark_energy_responses(
+        w0_step=0.05, wa_step=0.1, verbose=False
+    )
+
+    assert calls == 4
+    np.testing.assert_allclose(np.asarray(theory.dlnPk_dw0), 2.0)
+    np.testing.assert_allclose(np.asarray(theory.dlnPk_dwa), 3.0)
+    np.testing.assert_allclose(np.asarray(theory.dchi_dw0), 5.0)
+    np.testing.assert_allclose(np.asarray(theory.dchi_dwa), 7.0)
+    assert all(theory.dark_energy_response_metadata['cache_hits'].values())
+
+    # Only the two changed w0 locations are new; the wa stencil is reused.
+    theory.setup_dark_energy_responses(
+        w0_step=0.025, wa_step=0.1, verbose=False
+    )
+    assert calls == 6
+
+
+@pytest.mark.parametrize('name,value', [('w0_step', 0.0),
+                                        ('wa_step', -0.1),
+                                        ('w0_step', np.nan)])
+def test_dark_energy_stencil_rejects_invalid_steps(tmp_path, name, value):
+    theory = _bare_theory_with_cache(tmp_path)
+    theory.z_grid = np.array([0.0, 1.0])
+    theory.k_grid = np.array([0.01, 0.1])
+    theory.z_bg = np.array([0.0, 1.0])
+    kwargs = {'w0_step': 0.05, 'wa_step': 0.1, name: value}
+
+    with pytest.raises(ValueError, match=name):
+        theory.setup_dark_energy_responses(verbose=False, **kwargs)

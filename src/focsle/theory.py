@@ -85,6 +85,9 @@ OGATA_H = 1e-2   # step parameter
 # change. They are part of the persistent cache identity.
 CAMB_POWER_GRID_PRODUCT_VERSION = 1
 CAMB_BACKGROUND_GRID_PRODUCT_VERSION = 1
+CAMB_DARK_ENERGY_POINT_PRODUCT_VERSION = 1
+SIGMA8_NORMALISATION_RTOL = 1e-8
+SIGMA8_NORMALISATION_MAX_ITERATIONS = 3
 
 
 class TheoryJAX:
@@ -122,7 +125,9 @@ class TheoryJAX:
                 'omk': 0.0,
                 'tau': 0.054,
                 'As': 2.0e-9,
-                'ns': 0.965
+                'ns': 0.965,
+                'w0': -1.0,
+                'wa': 0.0,
             }
         else:
             self.cosmo_fid = cosmo_fid.copy()
@@ -138,6 +143,8 @@ class TheoryJAX:
             # (A_s = 2e-9): the Fisher fiducial must sit where the sims sit.
             # (Planck 2018 A_s = 2.1e-9 would give 0.8111.)
             self.cosmo_fid['sigma8'] = 0.7913
+        self.cosmo_fid.setdefault('w0', -1.0)
+        self.cosmo_fid.setdefault('wa', 0.0)
 
         # Setup lens distribution
         self.lens_file = lens_file
@@ -429,6 +436,237 @@ class TheoryJAX:
                     f"CAMB background cache array {name!r} has shape "
                     f"{arrays[name].shape}; expected {expected_shape}"
                 )
+
+    def setup_dark_energy_responses(self, w0_step: float = 0.05,
+                                    wa_step: float = 0.1,
+                                    verbose: bool = True):
+        """Cache the central w0/wa CAMB stencil at fixed Omega_m and sigma8.
+
+        This is opt-in: the existing two-parameter forecast does not pay for
+        these four displaced cosmologies. Raw stencil points and their central
+        response arrays are retained for Step 4 and for convergence audits.
+        """
+        if not all(hasattr(self, name) for name in
+                   ('z_grid', 'k_grid', 'z_bg')):
+            raise RuntimeError(
+                "Call setup_Pk_grid() before setup_dark_energy_responses()"
+            )
+        for name, step in (('w0_step', w0_step), ('wa_step', wa_step)):
+            if not np.isfinite(step) or step <= 0:
+                raise ValueError(f"{name} must be finite and positive")
+
+        w0_fid = float(self.cosmo_fid['w0'])
+        wa_fid = float(self.cosmo_fid['wa'])
+        target_sigma8 = float(self.cosmo_fid['sigma8'])
+        z_grid = np.asarray(self.z_grid)
+        k_grid = np.asarray(self.k_grid)
+        z_background = np.asarray(self.z_bg)
+        point_parameters = {
+            'w0_minus': (w0_fid - w0_step, wa_fid),
+            'w0_plus': (w0_fid + w0_step, wa_fid),
+            'wa_minus': (w0_fid, wa_fid - wa_step),
+            'wa_plus': (w0_fid, wa_fid + wa_step),
+        }
+
+        if verbose:
+            print("\nSetting up fixed-sigma_8 CAMB dark-energy responses...")
+            print(f"  Fiducial: w0={w0_fid:g}, wa={wa_fid:g}, "
+                  f"sigma_8={target_sigma8:g}")
+            print(f"  Central steps: delta_w0={w0_step:g}, "
+                  f"delta_wa={wa_step:g}")
+
+        points = {}
+        cache_hits = {}
+        for label, (w0, wa) in point_parameters.items():
+            configuration = self._dark_energy_point_cache_configuration(
+                w0, wa, target_sigma8, z_grid, k_grid, z_background
+            )
+            arrays, cache_hit = self.camb_cache.get_or_compute(
+                configuration,
+                lambda w0=w0, wa=wa: self._compute_dark_energy_point(
+                    w0, wa, target_sigma8, z_grid, k_grid, z_background
+                ),
+            )
+            self._validate_dark_energy_point(
+                arrays,
+                nz=len(z_grid),
+                nk=len(k_grid),
+                n_background=len(z_background),
+                target_sigma8=target_sigma8,
+            )
+            points[label] = arrays
+            cache_hits[label] = cache_hit
+            if verbose:
+                source = 'cache' if cache_hit else 'CAMB'
+                print(f"  {label}: w0={w0:g}, wa={wa:g}, "
+                      f"A_s={float(arrays['As']):.8e}, "
+                      f"sigma_8={float(arrays['sigma8']):.8f} ({source})")
+
+        self.w0_step = float(w0_step)
+        self.wa_step = float(wa_step)
+        self.dark_energy_response_points = points
+        self.dlnPk_dw0 = jnp.array(
+            (np.log(points['w0_plus']['Pk'])
+             - np.log(points['w0_minus']['Pk'])) / (2.0 * w0_step)
+        )
+        self.dlnPk_dwa = jnp.array(
+            (np.log(points['wa_plus']['Pk'])
+             - np.log(points['wa_minus']['Pk'])) / (2.0 * wa_step)
+        )
+        self.dchi_dw0 = jnp.array(
+            (points['w0_plus']['chi'] - points['w0_minus']['chi'])
+            / (2.0 * w0_step)
+        )
+        self.dchi_dwa = jnp.array(
+            (points['wa_plus']['chi'] - points['wa_minus']['chi'])
+            / (2.0 * wa_step)
+        )
+        self.dark_energy_response_metadata = {
+            'fiducial': {'w0': w0_fid, 'wa': wa_fid,
+                         'sigma8': target_sigma8},
+            'steps': {'w0': float(w0_step), 'wa': float(wa_step)},
+            'cache_hits': cache_hits,
+            'point_parameters': point_parameters,
+            'As': {label: float(arrays['As'])
+                   for label, arrays in points.items()},
+            'achieved_sigma8': {
+                label: float(arrays['sigma8'])
+                for label, arrays in points.items()
+            },
+        }
+
+    def _dark_energy_point_cache_configuration(
+            self, w0, wa, target_sigma8, z_grid, k_grid, z_background):
+        """Identity of one fixed-sigma8 CAMB dark-energy stencil point."""
+        return {
+            'product': 'dark_energy_response_point',
+            'product_version': CAMB_DARK_ENERGY_POINT_PRODUCT_VERSION,
+            'camb_version': getattr(camb, '__version__', 'unknown'),
+            'cosmology': {
+                'H0': self.cosmo_fid['H0'],
+                'ombh2': self.cosmo_fid['ombh2'],
+                'Omega_m': self.cosmo_fid['Omega_m'],
+                'mnu': self.cosmo_fid['mnu'],
+                'omk': self.cosmo_fid['omk'],
+                'tau': self.cosmo_fid['tau'],
+                'ns': self.cosmo_fid['ns'],
+                'w0': w0,
+                'wa': wa,
+                'dark_energy_model': 'ppf',
+            },
+            'normalisation': {
+                'parameter': 'sigma8_z0',
+                'target': target_sigma8,
+                'initial_As': self.cosmo_fid['As'],
+                'relative_tolerance': SIGMA8_NORMALISATION_RTOL,
+                'maximum_iterations': SIGMA8_NORMALISATION_MAX_ITERATIONS,
+            },
+            'calculation': {
+                'nonlinear': 'NonLinear_both',
+                'interpolator_nonlinear': True,
+                'hubble_units': False,
+                'k_hunit': False,
+                'matter_power_kmax': K_MAX_CAMB,
+            },
+            'z_grid': z_grid,
+            'k_grid': k_grid,
+            'background_z_grid': z_background,
+        }
+
+    def _camb_results_for_dark_energy(self, w0, wa, As, z_grid):
+        """Run one CAMB cosmology used while normalising a stencil point."""
+        Om = self.cosmo_fid['Omega_m']
+        pars = camb.CAMBparams()
+        pars.set_cosmology(
+            H0=self.cosmo_fid['H0'],
+            ombh2=self.cosmo_fid['ombh2'],
+            omch2=(Om * (self.cosmo_fid['H0'] / 100) ** 2
+                   - self.cosmo_fid['ombh2']),
+            mnu=self.cosmo_fid['mnu'],
+            omk=self.cosmo_fid['omk'],
+            tau=self.cosmo_fid['tau'],
+        )
+        pars.set_dark_energy(w=w0, wa=wa, dark_energy_model='ppf')
+        pars.InitPower.set_params(As=As, ns=self.cosmo_fid['ns'])
+        pars.set_matter_power(redshifts=z_grid.tolist(), kmax=K_MAX_CAMB)
+        pars.NonLinear = model.NonLinear_both
+        return camb.get_results(pars)
+
+    def _compute_dark_energy_point(self, w0, wa, target_sigma8,
+                                   z_grid, k_grid, z_background):
+        """Calculate one w0/wa point after normalising As to fixed sigma8."""
+        As = float(self.cosmo_fid['As'])
+        results = None
+        achieved_sigma8 = np.nan
+        for _ in range(SIGMA8_NORMALISATION_MAX_ITERATIONS):
+            results = self._camb_results_for_dark_energy(w0, wa, As, z_grid)
+            achieved_sigma8 = float(results.get_sigma8()[-1])
+            if not np.isfinite(achieved_sigma8) or achieved_sigma8 <= 0:
+                raise RuntimeError(
+                    f"CAMB returned invalid sigma8={achieved_sigma8} "
+                    f"for w0={w0}, wa={wa}"
+                )
+            relative_error = abs(achieved_sigma8 / target_sigma8 - 1.0)
+            if relative_error <= SIGMA8_NORMALISATION_RTOL:
+                break
+            As *= (target_sigma8 / achieved_sigma8) ** 2
+        else:
+            raise RuntimeError(
+                f"Could not normalise sigma8 for w0={w0}, wa={wa}: "
+                f"target={target_sigma8}, achieved={achieved_sigma8}"
+            )
+
+        interpolator = results.get_matter_power_interpolator(
+            nonlinear=True, hubble_units=False, k_hunit=False
+        )
+        Pk = np.empty((len(z_grid), len(k_grid)))
+        for iz, z in enumerate(z_grid):
+            Pk[iz, :] = interpolator.P(z, k_grid)
+        chi = np.asarray(results.comoving_radial_distance(z_background))
+        return {
+            'Pk': Pk,
+            'chi': chi,
+            'As': np.asarray(As),
+            'sigma8': np.asarray(achieved_sigma8),
+        }
+
+    @staticmethod
+    def _validate_dark_energy_point(arrays, nz, nk, n_background,
+                                    target_sigma8):
+        """Validate one cached dark-energy stencil point before use."""
+        expected_shapes = {
+            'chi': (n_background,),
+            'As': (),
+            'sigma8': (),
+        }
+        # P(k,z) has two dimensions; keep its more informative check separate.
+        if 'Pk' not in arrays or arrays['Pk'].shape != (nz, nk):
+            shape = None if 'Pk' not in arrays else arrays['Pk'].shape
+            raise CambCacheCorruptionError(
+                f"CAMB dark-energy cache Pk has shape {shape}; "
+                f"expected {(nz, nk)}"
+            )
+        for name, expected_shape in expected_shapes.items():
+            if name not in arrays or arrays[name].shape != expected_shape:
+                shape = None if name not in arrays else arrays[name].shape
+                raise CambCacheCorruptionError(
+                    f"CAMB dark-energy cache {name} has shape {shape}; "
+                    f"expected {expected_shape}"
+                )
+        if not np.all(np.isfinite(arrays['Pk'])) or np.any(arrays['Pk'] <= 0):
+            raise CambCacheCorruptionError(
+                "CAMB dark-energy cache contains invalid matter power"
+            )
+        if not np.all(np.isfinite(arrays['chi'])):
+            raise CambCacheCorruptionError(
+                "CAMB dark-energy cache contains invalid distances"
+            )
+        achieved_sigma8 = float(arrays['sigma8'])
+        if abs(achieved_sigma8 / target_sigma8 - 1.0) > SIGMA8_NORMALISATION_RTOL:
+            raise CambCacheCorruptionError(
+                f"CAMB dark-energy cache sigma8={achieved_sigma8} does not "
+                f"match target {target_sigma8}"
+            )
 
     @partial(jit, static_argnums=(0,))
     def chi_of_z(self, Om, z):
