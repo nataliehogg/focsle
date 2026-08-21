@@ -187,6 +187,56 @@ def test_dark_energy_stencil_is_cached_per_cosmology(tmp_path):
     assert calls == 6
 
 
+def test_baseline_cache_identity_includes_dark_energy_fiducial(tmp_path):
+    theory = _bare_theory_with_cache(tmp_path)
+    grid = np.array([0.25, 0.40])
+
+    lcdm_power = theory._power_grid_cache_configuration(
+        grid, grid, grid, grid
+    )
+    lcdm_background = theory._background_cache_configuration(grid, grid)
+
+    theory.cosmo_fid['w0'] = -0.838
+    theory.cosmo_fid['wa'] = -0.62
+    cpl_power = theory._power_grid_cache_configuration(
+        grid, grid, grid, grid
+    )
+    cpl_background = theory._background_cache_configuration(grid, grid)
+
+    assert theory.camb_cache.fingerprint(lcdm_power) != (
+        theory.camb_cache.fingerprint(cpl_power)
+    )
+    assert theory.camb_cache.fingerprint(lcdm_background) != (
+        theory.camb_cache.fingerprint(cpl_background)
+    )
+
+
+def test_dark_energy_stencil_accepts_non_lcdm_fiducial(tmp_path):
+    theory = _bare_theory_with_cache(tmp_path)
+    theory.cosmo_fid['w0'] = -0.838
+    theory.cosmo_fid['wa'] = -0.62
+    theory.z_grid = np.array([0.0, 1.0])
+    theory.k_grid = np.array([0.01, 0.1])
+    theory.z_bg = np.array([0.0, 1.0])
+
+    def fake_compute(w0, wa, target_sigma8, z_grid, k_grid, z_background):
+        return {
+            'Pk': np.full((len(z_grid), len(k_grid)), np.exp(w0 + wa)),
+            'chi': np.full(len(z_background), 100.0 + w0 + wa),
+            'As': np.asarray(2.0e-9),
+            'sigma8': np.asarray(target_sigma8),
+        }
+
+    theory._compute_dark_energy_point = fake_compute
+    theory.setup_dark_energy_responses(verbose=False)
+
+    assert theory.dark_energy_response_metadata['fiducial'] == {
+        'w0': -0.838,
+        'wa': -0.62,
+        'sigma8': theory.cosmo_fid['sigma8'],
+    }
+
+
 @pytest.mark.parametrize('name,value', [('w0_step', 0.0),
                                         ('wa_step', -0.1),
                                         ('w0_step', np.nan)])

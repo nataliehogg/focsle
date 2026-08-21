@@ -131,8 +131,7 @@ def plot_fisher_ellipse(
         ellipse = Ellipse(
             fiducial, width, height,
             angle=np.degrees(angle),
-            facecolor=color,
-            alpha=alphas[i],
+            facecolor=matplotlib.colors.to_rgba(color, alphas[i]),
             edgecolor=color,
             linewidth=2,
             linestyle=linestyles[i],

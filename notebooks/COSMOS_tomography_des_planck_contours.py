@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Plot DES, Planck, Euclid, and COSMOS-Web LLLELP constraints."""
+"""Compare one-, three-, and six-bin COSMOS LLLELP forecasts."""
 
 import sys
 from pathlib import Path
@@ -10,11 +10,11 @@ import numpy as np
 import pandas as pd
 from chainconsumer import Chain
 from chainconsumer.plotting import plot_contour
+from sanglier.palettes import analogous, cool, green, purple, warm
 
 
 ROOT = Path(__file__).resolve().parents[1]
-URF_ROOT = Path('/home/nataliehogg/Documents/Applications/2026/URF')
-STT_ROOT = Path('/home/nataliehogg/Documents/Projects/6x2pt/figures')
+FIGURE_ROOT = Path('/home/nataliehogg/Documents/Projects/6x2pt/figures')
 sys.path.insert(0, str(ROOT / 'src'))
 
 from focsle.fisher import FisherForecast
@@ -25,17 +25,6 @@ try:
     plt.style.use('sanglier')
 except OSError:
     pass
-
-# from matplotlib import rc
-
-# rc('text', usetex=True)
-# rc('font', family='serif', size=11)
-
-# cool = ['#41b6c4', '#2c7fb8', '#253494']
-# warm = ['#fdcc8a', '#fc8d59', '#d7301f']
-
-from sanglier.palettes import warm, cool, green, purple
-
 
 
 DES_CHAIN_FILE = ROOT / 'data' / 'chain_3x2pt_lcdm_SR_maglim.txt'
@@ -49,23 +38,27 @@ PLANCK_DIR = (
 )
 PLANCK_PREFIX = 'base_plikHM_TTTEEE_lowl_lowE'
 
-RESULTS_FILE = (
-    ROOT
-    / 'results'
-    / 'fisher_results_Nlens=1e5_sigL=0.05_Nbin_z=6_SNR_goal=8_'
-      'Nbin_max=20_nsamp=1e6_audited_060726_As_matched.pkl'
-)
+COSMOS_RESULTS = {
+    'one bin': ROOT / 'results' / 'fisher_results_cosmos_lllelp.pkl',
+    'three bins': ROOT / 'results' / 'fisher_results_cosmos_3bin_lllelp.pkl',
+    'six bins': ROOT / 'results' / 'fisher_results_cosmos_6bin_lllelp.pkl',
+}
 
-COSMOS_RESULTS_FILE = (
-    ROOT / 'results' / 'fisher_results_cosmos_web_lllelp.pkl'
-)
-
-OUTPUT_FILE = (STT_ROOT/'LLLELP_des_planck_contours.pdf'
-    #URF_ROOT / 'proposal' / 'figures' / 'LLLELP_des_planck_contours.pdf'
-)
+OUTPUT_FILE = FIGURE_ROOT / 'COSMOS_tomography_des_planck_contours.pdf'
 
 OMEGA_M_LABEL = r'$\Omega_{\rm m}$'
 SIGMA_8_LABEL = r'$\sigma_8$'
+
+
+def filter_samples(omega_m, sigma_8, weights):
+    """Remove non-finite or zero-weight posterior samples."""
+    mask = (
+        np.isfinite(omega_m)
+        & np.isfinite(sigma_8)
+        & np.isfinite(weights)
+        & (weights > 0)
+    )
+    return omega_m[mask], sigma_8[mask], weights[mask]
 
 
 def load_des_chain(path):
@@ -101,23 +94,11 @@ def load_planck_chain(directory, prefix):
     if missing:
         raise FileNotFoundError(f'Missing Planck chain files: {missing}')
 
-    # CosmoMC columns are: multiplicity weight, -log(likelihood), parameters.
     data = np.concatenate([np.loadtxt(path) for path in chain_paths], axis=0)
     omega_m = data[:, parameter_names.index('omegam') + 2]
     sigma_8 = data[:, parameter_names.index('sigma8') + 2]
     weights = data[:, 0]
     return filter_samples(omega_m, sigma_8, weights)
-
-
-def filter_samples(omega_m, sigma_8, weights):
-    """Remove non-finite or zero-weight posterior samples."""
-    mask = (
-        np.isfinite(omega_m)
-        & np.isfinite(sigma_8)
-        & np.isfinite(weights)
-        & (weights > 0)
-    )
-    return omega_m[mask], sigma_8[mask], weights[mask]
 
 
 def make_chain(omega_m, sigma_8, weights, **settings):
@@ -132,10 +113,9 @@ def make_chain(omega_m, sigma_8, weights, **settings):
 
 def figure_of_merit(omega_m, sigma_8, weights):
     """Return the inverse square root of the weighted covariance determinant."""
-    normalised_weights = weights / weights.sum()
     covariance = np.cov(
         np.stack([omega_m, sigma_8]),
-        aweights=normalised_weights,
+        aweights=weights / weights.sum(),
     )
     return 1.0 / np.sqrt(np.linalg.det(covariance))
 
@@ -157,7 +137,7 @@ des_chain = make_chain(
     bins=20,
     shade_gradient=0.8,
     linewidth=2.0,
-    zorder=20,
+    zorder=10,
 )
 
 planck_chain = make_chain(
@@ -171,51 +151,47 @@ planck_chain = make_chain(
     bins=20,
     shade_gradient=0.8,
     linewidth=2.0,
-    zorder=30,
+    zorder=15,
 )
 
-results = FisherForecast.load_results(RESULTS_FILE)
-fisher_lllelp = results['fisher_matrices']['Combined']
-fiducial = tuple(results['fiducial'])
+forecast_results = {
+    name: FisherForecast.load_results(path)
+    for name, path in COSMOS_RESULTS.items()
+}
 
+print(
+    f'FoM DES Y3 3x2pt:       '
+    f'{figure_of_merit(des_omega_m, des_sigma_8, des_weights):.1f}'
+)
+print(
+    f'FoM Planck 2018:         '
+    f'{figure_of_merit(planck_omega_m, planck_sigma_8, planck_weights):.1f}'
+)
+for name, results in forecast_results.items():
+    fisher = results['fisher_matrices']['Combined']
+    print(f'FoM COSMOS {name:10s}: {np.sqrt(np.linalg.det(fisher)):.1f}')
 
-cosmos_results = FisherForecast.load_results(COSMOS_RESULTS_FILE)
-fisher_cosmos = cosmos_results['fisher_matrices']['Combined']
-cosmos_fiducial = tuple(cosmos_results['fiducial'])
-fom_des = figure_of_merit(des_omega_m, des_sigma_8, des_weights)
-fom_planck = figure_of_merit(planck_omega_m, planck_sigma_8, planck_weights)
-fom_forecast = np.sqrt(np.linalg.det(fisher_lllelp))
-
-fom_cosmos = np.sqrt(np.linalg.det(fisher_cosmos))
-print(f'FoM DES Y3 3x2pt:          {fom_des:.1f}')
-print(f'FoM Planck 2018 TTTEEE:    {fom_planck:.1f}')
-print(f'FoM Euclid LOS (forecast): {fom_forecast:.1f}')
-
-print(f'FoM COSMOS-Web LLLELP:     {fom_cosmos:.1f}')
 fig, ax = plt.subplots(figsize=(5.2, 4.6))
 
 plot_contour(ax, des_chain, px=OMEGA_M_LABEL, py=SIGMA_8_LABEL)
 plot_contour(ax, planck_chain, px=OMEGA_M_LABEL, py=SIGMA_8_LABEL)
 
-
-plot_fisher_ellipse(
-    fisher_cosmos,
-    cosmos_fiducial,
-    ax,
-    color=green[2],
-    label=r'COSMOS-Web LLLELP',
-    show_2sigma=True,
-    zorder=10,
-)
-plot_fisher_ellipse(
-    fisher_lllelp,
-    fiducial,
-    ax,
-    color=warm[2],
-    label=r'Euclid DR3 LLLELP',
-    show_2sigma=True,
-    zorder=100,
-)
+forecast_styles = {
+    'one bin': (warm[2], r'COSMOS, one source bin'),
+    'three bins': (green[2], r'COSMOS, three source bins'),
+    'six bins': (analogous[0], r'COSMOS, six source bins'),
+}
+for name, results in forecast_results.items():
+    color, label = forecast_styles[name]
+    plot_fisher_ellipse(
+        results['fisher_matrices']['Combined'],
+        tuple(results['fiducial']),
+        ax,
+        color=color,
+        label=label,
+        show_2sigma=True,
+        zorder=20,
+    )
 
 ax.set_xlim(0.05, 0.58)
 ax.set_ylim(0.50, 1.08)
@@ -224,30 +200,18 @@ ax.set_ylabel(SIGMA_8_LABEL, fontsize=9)
 ax.tick_params(labelsize=9)
 ax.set_box_aspect(1)
 
-
 legend_handles = [
-
-    mpatches.Patch(
-        color=cool[1],
-        alpha=0.6,
-        label=r'DES Y3 EEEPPP',
-    ),
+    mpatches.Patch(color=cool[1], alpha=0.6, label='DES Y3'),
     mpatches.Patch(
         color=purple[2],
         alpha=0.6,
-        label=r'Planck 2018 TTTEEE+lowE',
-    ),
-    mpatches.Patch(
-        color=warm[2],
-        alpha=0.6,
-        label=r'Euclid DR3 LLLELP',
-    ),
-    mpatches.Patch(
-        color=green[2],
-        alpha=0.6,
-        label=r'COSMOS-Web LLLELP',
+        label='Planck 2018 TTTEEE+lowE',
     ),
 ]
+legend_handles.extend(
+    mpatches.Patch(color=color, alpha=0.6, label=label)
+    for color, label in forecast_styles.values()
+)
 ax.legend(handles=legend_handles, loc='upper right', fontsize=8, frameon=False)
 
 fig.tight_layout()

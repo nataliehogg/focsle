@@ -5,6 +5,8 @@ This module provides functions to load covariance matrices, redshift distributio
 and angular distributions from data directories.
 """
 
+import hashlib
+import json
 import sys
 import types
 import numpy as np
@@ -65,6 +67,21 @@ def _register_pickling_shims():
             width = zzmax - zzmin
             return float(1.0 / width) if width > 0.0 else 0.0
 
+    class HistogramRedshiftDistribution:
+        """Callable stand-in for current LOSCOV histogram n(z) pickles."""
+
+        def __call__(self, z):
+            redshift = np.asarray(z, dtype=float)
+            scalar = redshift.ndim == 0
+            values = np.zeros(redshift.shape, dtype=float)
+            indices = np.searchsorted(self.upper_edges, redshift, side='right')
+            mask = (
+                (redshift >= self.lower_edges[0])
+                & (redshift < self.upper_edges[-1])
+            )
+            values[mask] = self.densities[indices[mask]]
+            return float(values) if scalar else values
+
     class Angular_Distributions:
         def __init__(self, *args, **kwargs):
             pass
@@ -83,6 +100,7 @@ def _register_pickling_shims():
 
     shim_rd.redshift_distribution_Euclid = redshift_distribution_Euclid
     shim_rd.Redshift_Distributions = Redshift_Distributions
+    shim_rd.HistogramRedshiftDistribution = HistogramRedshiftDistribution
     shim_ad.Angular_Distributions = Angular_Distributions
     shim_functions.redshift_distributions = shim_rd
     shim_functions.angular_distributions = shim_ad
@@ -93,6 +111,52 @@ def _register_pickling_shims():
 
 
 _register_pickling_shims()
+
+
+LOSCOV_PICKLE_MANIFEST_KEY = '__loscov_artifact_manifest__'
+LOSCOV_PICKLE_PAYLOAD_KEY = '__loscov_artifact_payload__'
+
+
+def load_loscov_pickle(path):
+    """Load legacy or manifested LOSCOV pickle data.
+
+    Current LOSCOV dictionary artifacts retain their scientific payload at the
+    top level and add a reserved manifest record. Non-dictionary payloads use
+    a two-key envelope. Validate the embedded fingerprint before removing the
+    metadata so FOCSLE never consumes a corrupt current-format artifact.
+    """
+    path = Path(path)
+    with path.open('rb') as source:
+        value = pickle.load(source)
+
+    if not isinstance(value, dict) or LOSCOV_PICKLE_MANIFEST_KEY not in value:
+        return value
+
+    record = value[LOSCOV_PICKLE_MANIFEST_KEY]
+    if not isinstance(record, dict) or not isinstance(record.get('manifest'), dict):
+        raise ValueError(f'Invalid LOSCOV manifest record in {path}')
+    canonical = json.dumps(
+        record['manifest'],
+        sort_keys=True,
+        separators=(',', ':'),
+        ensure_ascii=True,
+    ).encode('utf-8')
+    fingerprint = hashlib.sha256(canonical).hexdigest()
+    if record.get('fingerprint') != fingerprint:
+        raise ValueError(f'Corrupt LOSCOV manifest fingerprint in {path}')
+
+    if LOSCOV_PICKLE_PAYLOAD_KEY in value:
+        expected_keys = {
+            LOSCOV_PICKLE_MANIFEST_KEY,
+            LOSCOV_PICKLE_PAYLOAD_KEY,
+        }
+        if set(value) != expected_keys:
+            raise ValueError(f'Invalid LOSCOV pickle envelope in {path}')
+        return value[LOSCOV_PICKLE_PAYLOAD_KEY]
+
+    payload = value.copy()
+    del payload[LOSCOV_PICKLE_MANIFEST_KEY]
+    return payload
 
 
 def list_available_datasets(data_root: str) -> List[str]:
@@ -170,8 +234,7 @@ def detect_nbins(data_dir: str) -> int:
     # Try to detect from redshift distributions
     zdist_file = data_dir / 'redshift_distributions'
     if zdist_file.exists():
-        with open(zdist_file, 'rb') as f:
-            zdist = pickle.load(f)
+        zdist = load_loscov_pickle(zdist_file)
         if 'E' in zdist and hasattr(zdist['E'], 'Nbinz'):
             return zdist['E'].Nbinz
 
@@ -248,7 +311,11 @@ def get_probe_sections(probe: str, nbins_L: int, nbins_E: int,
 
 def is_new_format(data_dir: str) -> bool:
     """True if the dataset uses the new 4-index (6-probe capable) layout."""
-    return (Path(data_dir) / 'covariance' / 'LLLL' / 'ccov_0_0_0_0').exists()
+    covariance_dir = Path(data_dir) / 'covariance'
+    return any(
+        (covariance_dir / (probe + probe) / 'ccov_0_0_0_0').exists()
+        for probe in PROBE_ORDER
+    )
 
 
 def _load_matrix_file(path: Path) -> np.ndarray:
@@ -655,10 +722,7 @@ def load_redshift_distributions(data_dir: str):
     data_dir = Path(data_dir)
     zdist_file = data_dir / 'redshift_distributions'
 
-    with open(zdist_file, 'rb') as f:
-        zdist = pickle.load(f)
-
-    return zdist
+    return load_loscov_pickle(zdist_file)
 
 
 def load_angular_distributions(data_dir: str):
@@ -674,10 +738,7 @@ def load_angular_distributions(data_dir: str):
     data_dir = Path(data_dir)
     ang_file = data_dir / 'angular_distributions'
 
-    with open(ang_file, 'rb') as f:
-        ang_dist = pickle.load(f)
-
-    return ang_dist
+    return load_loscov_pickle(ang_file)
 
 
 def load_lens_catalog(lens_file: str) -> Tuple[np.ndarray, np.ndarray]:

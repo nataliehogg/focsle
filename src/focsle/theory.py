@@ -38,7 +38,7 @@ except RuntimeError:
 # Redshift grid defaults for P(k) computation
 # Covers z(chi) over the full Limber integration range (chi_max = 8000 Mpc
 # corresponds to z ~ 4.3); queries beyond the grid clamp to the edge.
-Z_MAX_CAMB = 4.6  # Maximum redshift for CAMB P(k) grid
+Z_MAX_CAMB = 14.0 #4.6  # Maximum redshift for CAMB P(k) grid
 Z_MIN_CAMB = 0.0  # Minimum redshift (today)
 
 # Wavenumber grid defaults for P(k) computation.
@@ -83,8 +83,8 @@ OGATA_H = 1e-2   # step parameter
 
 # Bump these when the corresponding CAMB calculation or stored array semantics
 # change. They are part of the persistent cache identity.
-CAMB_POWER_GRID_PRODUCT_VERSION = 1
-CAMB_BACKGROUND_GRID_PRODUCT_VERSION = 1
+CAMB_POWER_GRID_PRODUCT_VERSION = 2
+CAMB_BACKGROUND_GRID_PRODUCT_VERSION = 2
 CAMB_DARK_ENERGY_POINT_PRODUCT_VERSION = 1
 SIGMA8_NORMALISATION_RTOL = 1e-8
 SIGMA8_NORMALISATION_MAX_ITERATIONS = 3
@@ -116,21 +116,20 @@ class TheoryJAX:
         # were generated with CAMB's default A_s = 2e-9 (and ns = 0.965);
         # using any other fiducial here puts a uniform amplitude offset
         # between theory and the simulated data vectors (audit A7/D3).
-        if cosmo_fid is None:
-            self.cosmo_fid = {
-                'H0': 67.37,
-                'ombh2': 0.0223,
-                'omch2': 0.1198,
-                'mnu': 0.06,
-                'omk': 0.0,
-                'tau': 0.054,
-                'As': 2.0e-9,
-                'ns': 0.965,
-                'w0': -1.0,
-                'wa': 0.0,
-            }
-        else:
-            self.cosmo_fid = cosmo_fid.copy()
+        self.cosmo_fid = {
+            'H0': 67.37,
+            'ombh2': 0.0223,
+            'omch2': 0.1198,
+            'mnu': 0.06,
+            'omk': 0.0,
+            'tau': 0.054,
+            'As': 2.0e-9,
+            'ns': 0.965,
+            'w0': -1.0,
+            'wa': 0.0,
+        }
+        if cosmo_fid is not None:
+            self.cosmo_fid.update(cosmo_fid)
 
         # Compute derived parameters
         if 'Omega_m' not in self.cosmo_fid:
@@ -213,6 +212,42 @@ class TheoryJAX:
         self.z_s_array = np.array([1.2, 1.5, 1.8, 2.0, 2.3])
         self.N_lenses = len(self.z_d_array)
 
+    def configure_survey_range(self, data_dir: str, verbose: bool = True):
+        """Extend theory grids when a survey reaches beyond Euclid redshifts.
+
+        Euclid-scale datasets retain the historical defaults. Higher-redshift
+        surveys receive proportionally denser CAMB and Limber grids so their
+        kernels are not silently clamped.
+        """
+        from .data_loader import load_loscov_pickle
+
+        distributions = load_loscov_pickle(
+            Path(data_dir) / 'redshift_distributions'
+        )
+        redshift_limits = [
+            float(np.max(self.z_d_array)),
+            float(np.max(self.z_s_array)),
+        ]
+        for probe in ('E', 'P'):
+            distribution = distributions.get(probe)
+            if distribution is not None and hasattr(distribution, 'limits'):
+                redshift_limits.append(float(np.max(distribution.limits)))
+
+        requested_z_max = max(redshift_limits)
+        if not np.isfinite(requested_z_max) or requested_z_max <= 0.0:
+            raise ValueError(
+                f'Invalid maximum survey redshift: {requested_z_max}'
+            )
+
+        self.survey_z_max = max(
+            Z_MAX_CAMB, float(np.ceil(requested_z_max))
+        )
+        if verbose:
+            print(
+                f'Survey redshift support: z <= {requested_z_max:.3f}; '
+                f'theory grid z_max = {self.survey_z_max:.1f}'
+            )
+
     def setup_Pk_grid(self, Om_range: Tuple[float, float] = (0.25, 0.40),
                       As_range: Tuple[float, float] = (1.5e-9, 2.7e-9),
                       nOm: int = 5, nAs: int = 5, nz: int = 50, nk: int = 100,
@@ -225,7 +260,11 @@ class TheoryJAX:
 
         Om_grid = np.linspace(*Om_range, nOm)
         As_grid = np.linspace(*As_range, nAs)
-        z_grid = np.linspace(Z_MIN_CAMB, Z_MAX_CAMB, nz)
+        z_max = getattr(self, 'survey_z_max', Z_MAX_CAMB)
+        effective_nz = max(
+            nz, int(np.ceil(nz * z_max / Z_MAX_CAMB))
+        )
+        z_grid = np.linspace(Z_MIN_CAMB, z_max, effective_nz)
         k_grid = np.logspace(np.log10(K_MIN_CAMB), np.log10(K_MAX_CAMB), nk)
 
         configuration = self._power_grid_cache_configuration(
@@ -238,7 +277,7 @@ class TheoryJAX:
             ),
         )
         self._validate_power_grid_arrays(
-            arrays, nOm=nOm, nAs=nAs, nz=nz, nk=nk
+            arrays, nOm=nOm, nAs=nAs, nz=effective_nz, nk=nk
         )
 
         self.Om_grid = jnp.array(arrays['Om_grid'])
@@ -269,7 +308,9 @@ class TheoryJAX:
                 'omk': self.cosmo_fid['omk'],
                 'tau': self.cosmo_fid['tau'],
                 'ns': self.cosmo_fid['ns'],
-                'dark_energy': 'CAMB_default_LambdaCDM',
+                'w0': self.cosmo_fid['w0'],
+                'wa': self.cosmo_fid['wa'],
+                'dark_energy_model': 'ppf',
             },
             'calculation': {
                 'nonlinear': 'NonLinear_both',
@@ -302,6 +343,11 @@ class TheoryJAX:
                     mnu=self.cosmo_fid['mnu'],
                     omk=self.cosmo_fid['omk'],
                     tau=self.cosmo_fid['tau'],
+                )
+                pars.set_dark_energy(
+                    w=self.cosmo_fid['w0'],
+                    wa=self.cosmo_fid['wa'],
+                    dark_energy_model='ppf',
                 )
                 pars.InitPower.set_params(As=As, ns=self.cosmo_fid['ns'])
                 pars.set_matter_power(
@@ -359,7 +405,8 @@ class TheoryJAX:
         """Set up the cached background distance table over Omega_m."""
         n_Om = max(len(Om_grid), n_Om_min)
         Om_grid = np.linspace(Om_grid[0], Om_grid[-1], n_Om)
-        z_grid = np.linspace(0, 7, 500)
+        z_max = max(7.0, getattr(self, 'survey_z_max', Z_MAX_CAMB))
+        z_grid = np.linspace(0, z_max, max(500, int(np.ceil(500 * z_max / 7.0))))
 
         configuration = self._background_cache_configuration(Om_grid, z_grid)
         arrays, cache_hit = self.camb_cache.get_or_compute(
@@ -373,6 +420,22 @@ class TheoryJAX:
         self.z_bg = jnp.array(arrays['z_bg'])
         self.Om_bg = jnp.array(arrays['Om_bg'])
         self.chi_bg_table = jnp.array(arrays['chi_bg_table'])
+        required_chi_max = float(np.max(arrays['chi_bg_table'][:, -1]))
+        self.extended_survey_grid = required_chi_max > CHI_MAX_DEFAULT
+        if self.extended_survey_grid:
+            cl_chi_max = max(CHI_MAX_DEFAULT, required_chi_max)
+            cl_nchi = max(
+                N_CHI_CL,
+                int(np.ceil(N_CHI_CL * cl_chi_max / CHI_MAX_DEFAULT)),
+            )
+            self.chi_cl_grid = jnp.linspace(
+                CHI_MIN_DEFAULT, cl_chi_max, cl_nchi
+            )
+            self.kernel_chi_max = max(CHI_MAX_QL_GRID, required_chi_max)
+            self.kernel_nchi = max(
+                N_CHI_QL,
+                int(np.ceil(N_CHI_QL * self.kernel_chi_max / CHI_MAX_QL_GRID)),
+            )
 
         if verbose:
             source = "persistent cache" if cache_hit else "new CAMB calculations"
@@ -390,7 +453,9 @@ class TheoryJAX:
                 'ombh2': self.cosmo_fid['ombh2'],
                 'mnu': self.cosmo_fid['mnu'],
                 'omk': self.cosmo_fid['omk'],
-                'dark_energy': 'CAMB_default_LambdaCDM',
+                'w0': self.cosmo_fid['w0'],
+                'wa': self.cosmo_fid['wa'],
+                'dark_energy_model': 'ppf',
             },
             'Om_grid': Om_grid,
             'z_grid': z_grid,
@@ -408,6 +473,11 @@ class TheoryJAX:
                        - self.cosmo_fid['ombh2']),
                 mnu=self.cosmo_fid['mnu'],
                 omk=self.cosmo_fid['omk'],
+            )
+            pars.set_dark_energy(
+                w=self.cosmo_fid['w0'],
+                wa=self.cosmo_fid['wa'],
+                dark_energy_model='ppf',
             )
             background = camb.get_background(pars)
             chi_table[i, :] = background.comoving_radial_distance(z_grid)
@@ -457,13 +527,6 @@ class TheoryJAX:
 
         w0_fid = float(self.cosmo_fid['w0'])
         wa_fid = float(self.cosmo_fid['wa'])
-        if not (np.isclose(w0_fid, -1.0) and np.isclose(wa_fid, 0.0)):
-            raise NotImplementedError(
-                "The current Omega_m--sigma8 baseline grids are centred on "
-                "LambdaCDM (w0=-1, wa=0); a different dark-energy fiducial "
-                "would require rebuilding those baseline grids with the "
-                "same fiducial model"
-            )
         target_sigma8 = float(self.cosmo_fid['sigma8'])
         z_grid = np.asarray(self.z_grid)
         k_grid = np.asarray(self.k_grid)
@@ -838,8 +901,9 @@ class TheoryJAX:
         data_dir = Path(data_dir)
         zdist_file = data_dir / 'redshift_distributions'
 
-        with open(zdist_file, 'rb') as f:
-            zdist = pickle.load(f)
+        from .data_loader import load_loscov_pickle
+
+        zdist = load_loscov_pickle(zdist_file)
 
         self.E_dist = zdist['E']
         self.P_dist = zdist['P']
@@ -862,8 +926,15 @@ class TheoryJAX:
 
         # Pre-compute distribution tables and kernels on fixed grids.
         self._precompute_distribution_pdfs(verbose=verbose)
-        self._precompute_QL_mean(verbose=verbose)
-        self._precompute_QE_mean(verbose=verbose)
+        requested_probes = getattr(self, 'requested_probes', None)
+        if requested_probes is None or any(
+            probe in requested_probes for probe in ('LL', 'LE', 'LP')
+        ):
+            self._precompute_QL_mean(verbose=verbose)
+        if requested_probes is None or any(
+            probe in requested_probes for probe in ('LE', 'EE', 'EP')
+        ):
+            self._precompute_QE_mean(verbose=verbose)
 
     def _evaluate_bin_pdf(self, dist, bin_idx: int, z_grid: np.ndarray) -> np.ndarray:
         """Evaluate and normalize a tomographic-bin redshift PDF on a fixed z-grid."""
@@ -911,9 +982,14 @@ class TheoryJAX:
             print(f"Pre-computed E/P redshift PDFs on {nz} z-points")
 
     def _precompute_QL_mean(self, chi_min: float = CHI_MIN_DEFAULT,
-                            chi_max: float = CHI_MAX_QL_GRID,
-                            nchi: int = N_CHI_QL, verbose: bool = True):
+                            chi_max: Optional[float] = None,
+                            nchi: Optional[int] = None,
+                            verbose: bool = True):
         """Pre-compute LOS geometry and, when available, its CPL response."""
+        if chi_max is None:
+            chi_max = getattr(self, 'kernel_chi_max', CHI_MAX_QL_GRID)
+        if nchi is None:
+            nchi = getattr(self, 'kernel_nchi', N_CHI_QL)
         chi_grid_np = np.linspace(chi_min, chi_max, nchi)
         Om_grid_np = np.array(self.Om_bg)
         KL_mean_np = np.zeros((len(Om_grid_np), nchi))
@@ -979,9 +1055,14 @@ class TheoryJAX:
                   f"({len(Om_grid_np)} Om points x {nchi} chi points){suffix}")
 
     def _precompute_QE_mean(self, chi_min: float = CHI_MIN_DEFAULT,
-                            chi_max: float = CHI_MAX_QL_GRID,
-                            nchi: int = N_CHI_QL, verbose: bool = True):
+                            chi_max: Optional[float] = None,
+                            nchi: Optional[int] = None,
+                            verbose: bool = True):
         """Pre-compute shear geometry and, when available, its CPL response."""
+        if chi_max is None:
+            chi_max = getattr(self, 'kernel_chi_max', CHI_MAX_QL_GRID)
+        if nchi is None:
+            nchi = getattr(self, 'kernel_nchi', N_CHI_QL)
         chi_grid_np = np.linspace(chi_min, chi_max, nchi)
         Om_grid_np = np.array(self.Om_bg)
         KE_mean_np = np.zeros((len(Om_grid_np), self.Nbinz_E, nchi))
@@ -1145,7 +1226,8 @@ class TheoryJAX:
                           chi_max=CHI_MAX_DEFAULT, nchi=N_CHI_CL,
                           w0=None, wa=None):
         """Compute C_ell^LL using JAX - fully differentiable."""
-        chi_grid = jnp.linspace(chi_min, chi_max, nchi)
+        chi_grid = (self.chi_cl_grid if self.extended_survey_grid
+                    else jnp.linspace(chi_min, chi_max, nchi))
         z_grid = self.z_of_chi(Om, chi_grid, w0, wa)
         k_grid = (ell + 0.5) / chi_grid
 
@@ -1164,7 +1246,8 @@ class TheoryJAX:
                           chi_max=CHI_MAX_DEFAULT, nchi=N_CHI_CL,
                           w0=None, wa=None):
         """Compute C_ell^LE using mean Q_L and distribution-averaged Q_E kernels."""
-        chi_grid = jnp.linspace(chi_min, chi_max, nchi)
+        chi_grid = (self.chi_cl_grid if self.extended_survey_grid
+                    else jnp.linspace(chi_min, chi_max, nchi))
         z_grid = self.z_of_chi(Om, chi_grid, w0, wa)
         k_grid = (ell + 0.5) / chi_grid
 
@@ -1184,7 +1267,8 @@ class TheoryJAX:
                           chi_max=CHI_MAX_DEFAULT, nchi=N_CHI_CL,
                           w0=None, wa=None):
         """Compute C_ell^LP using mean Q_L and distribution-averaged Q_P kernels."""
-        chi_grid = jnp.linspace(chi_min, chi_max, nchi)
+        chi_grid = (self.chi_cl_grid if self.extended_survey_grid
+                    else jnp.linspace(chi_min, chi_max, nchi))
         z_grid = self.z_of_chi(Om, chi_grid, w0, wa)
         k_grid = (ell + 0.5) / chi_grid
 
@@ -1210,7 +1294,8 @@ class TheoryJAX:
         cosmic-shear data vector contains all bin pairs i >= j, not just
         the auto-bin spectra.
         """
-        chi_grid = jnp.linspace(chi_min, chi_max, nchi)
+        chi_grid = (self.chi_cl_grid if self.extended_survey_grid
+                    else jnp.linspace(chi_min, chi_max, nchi))
         z_grid = self.z_of_chi(Om, chi_grid, w0, wa)
         k_grid = (ell + 0.5) / chi_grid
 
@@ -1236,7 +1321,8 @@ class TheoryJAX:
         bin_e >= bin_p pairs carry signal (source behind lens); the loscov
         data vector stores exactly those.
         """
-        chi_grid = jnp.linspace(chi_min, chi_max, nchi)
+        chi_grid = (self.chi_cl_grid if self.extended_survey_grid
+                    else jnp.linspace(chi_min, chi_max, nchi))
         z_grid = self.z_of_chi(Om, chi_grid, w0, wa)
         k_grid = (ell + 0.5) / chi_grid
 
@@ -1258,7 +1344,8 @@ class TheoryJAX:
 
         Uses distribution-averaged Q_P × Q_P kernels.
         """
-        chi_grid = jnp.linspace(chi_min, chi_max, nchi)
+        chi_grid = (self.chi_cl_grid if self.extended_survey_grid
+                    else jnp.linspace(chi_min, chi_max, nchi))
         z_grid = self.z_of_chi(Om, chi_grid, w0, wa)
         k_grid = (ell + 0.5) / chi_grid
 
@@ -1428,8 +1515,9 @@ class TheoryJAX:
         data_dir = Path(data_dir)
         ang_file = data_dir / 'angular_distributions'
 
-        with open(ang_file, 'rb') as f:
-            ang_dist = pickle.load(f)
+        from .data_loader import load_loscov_pickle
+
+        ang_dist = load_loscov_pickle(ang_file)
 
         new_format = isinstance(ang_dist['LL_plus'], list)
 
@@ -1597,20 +1685,31 @@ class TheoryJAX:
         will produce them (after any theta cut). Used to verify alignment
         with the covariance before assembling a Fisher matrix.
         """
-        sizes = {
-            'LL': self.w_LL_minus.shape[0] + self.w_LL_plus.shape[0],
-            'LE': sum(self.w_LE_minus[i].shape[0] + self.w_LE_plus[i].shape[0]
-                      for i in range(len(self.w_LE_plus))),
-            'LP': sum(w.shape[0] for w in self.w_LP),
-        }
+        sizes = {}
+        if 'LL' in self.probes:
+            sizes['LL'] = (
+                self.w_LL_minus.shape[0] + self.w_LL_plus.shape[0]
+            )
+        if 'LE' in self.probes:
+            sizes['LE'] = sum(
+                self.w_LE_minus[i].shape[0] + self.w_LE_plus[i].shape[0]
+                for i in range(len(self.w_LE_plus))
+            )
+        if 'LP' in self.probes:
+            sizes['LP'] = sum(w.shape[0] for w in self.w_LP)
         if 'EE' in self.probes:
             sizes['EE'] = sum(self.w_EE_minus[k].shape[0] + self.w_EE_plus[k].shape[0]
                               for k in range(len(self.ee_pairs)))
+        if 'EP' in self.probes:
             sizes['EP'] = sum(w.shape[0] for w in self.w_EP)
+        if 'PP' in self.probes:
             sizes['PP'] = sum(w.shape[0] for w in self.w_PP)
         return sizes
 
-    def predict_data_vector_jax(self, Om, s8, ell_grid=None, w0=None, wa=None):
+    def predict_data_vector_jax(
+        self, Om, s8, ell_grid=None, w0=None, wa=None,
+        position_bias_amplitudes=None,
+    ):
         """
         Generate theory predictions for given cosmology using JAX.
 
@@ -1622,6 +1721,8 @@ class TheoryJAX:
             ell_grid: Multipoles for Hankel transform (if None, use default)
             w0, wa: CPL dark-energy parameters. Passing either requires
                 setup_dark_energy_responses() before galaxy setup.
+            position_bias_amplitudes: Multiplicative amplitudes relative to
+                the fiducial galaxy-bias model, one per P redshift bin.
 
         Returns:
             Flat array of predictions, shape (n_data,)
@@ -1636,6 +1737,19 @@ class TheoryJAX:
         if ell_grid is None:
             ell_grid = jnp.logspace(np.log10(ELL_MIN_DEFAULT), np.log10(ELL_MAX_DEFAULT), N_ELL_DEFAULT)
 
+        if position_bias_amplitudes is None:
+            position_bias_amplitudes = jnp.ones(self.Nbinz_P)
+        else:
+            position_bias_amplitudes = jnp.asarray(
+                position_bias_amplitudes, dtype=float
+            )
+            if position_bias_amplitudes.shape != (self.Nbinz_P,):
+                raise ValueError(
+                    'position_bias_amplitudes must have shape '
+                    f'({self.Nbinz_P},), got '
+                    f'{position_bias_amplitudes.shape}'
+                )
+
         predictions_parts = []
 
         # All entries are annulus averages over the angular bins (the loscov
@@ -1649,45 +1763,55 @@ class TheoryJAX:
         # entries in the first n_minus slots, giving uniform per-bin SNR.
 
         # LL predictions
-        Cl_LL_vals = vmap(
-            lambda ell: self.compute_Cl_LL_jax(
-                Om, s8, ell, w0=w0, wa=wa))(ell_grid)
+        if 'LL' in self.probes:
+            Cl_LL_vals = vmap(
+                lambda ell: self.compute_Cl_LL_jax(
+                    Om, s8, ell, w0=w0, wa=wa))(ell_grid)
 
-        xi_LL_plus = self._bin_average(
-            self.hankel_j0(Cl_LL_vals, ell_grid, self.nodes_LL_plus), self.w_LL_plus)
-        xi_LL_minus = self._bin_average(
-            self.hankel_j4(Cl_LL_vals, ell_grid, self.nodes_LL_minus), self.w_LL_minus)
-        predictions_parts.append(xi_LL_minus)
-        predictions_parts.append(xi_LL_plus)
+            xi_LL_plus = self._bin_average(
+                self.hankel_j0(Cl_LL_vals, ell_grid, self.nodes_LL_plus),
+                self.w_LL_plus)
+            xi_LL_minus = self._bin_average(
+                self.hankel_j4(Cl_LL_vals, ell_grid, self.nodes_LL_minus),
+                self.w_LL_minus)
+            predictions_parts.append(xi_LL_minus)
+            predictions_parts.append(xi_LL_plus)
 
         n_e_bins = len(self.theta_LE_plus)
         n_p_bins = len(self.theta_LP)
 
         # LE predictions
-        for bin_idx in range(n_e_bins):
-            Cl_LE_vals = vmap(
-                lambda ell: self.compute_Cl_LE_jax(
-                    Om, s8, ell, bin_idx, w0=w0, wa=wa))(ell_grid)
+        if 'LE' in self.probes:
+            for bin_idx in range(n_e_bins):
+                Cl_LE_vals = vmap(
+                    lambda ell: self.compute_Cl_LE_jax(
+                        Om, s8, ell, bin_idx, w0=w0, wa=wa))(ell_grid)
 
-            xi_LE_plus = self._bin_average(
-                self.hankel_j0(Cl_LE_vals, ell_grid, self.nodes_LE_plus[bin_idx]),
-                self.w_LE_plus[bin_idx])
-            xi_LE_minus = self._bin_average(
-                self.hankel_j4(Cl_LE_vals, ell_grid, self.nodes_LE_minus[bin_idx]),
-                self.w_LE_minus[bin_idx])
-            predictions_parts.append(xi_LE_minus)
-            predictions_parts.append(xi_LE_plus)
+                xi_LE_plus = self._bin_average(
+                    self.hankel_j0(
+                        Cl_LE_vals, ell_grid, self.nodes_LE_plus[bin_idx]),
+                    self.w_LE_plus[bin_idx])
+                xi_LE_minus = self._bin_average(
+                    self.hankel_j4(
+                        Cl_LE_vals, ell_grid, self.nodes_LE_minus[bin_idx]),
+                    self.w_LE_minus[bin_idx])
+                predictions_parts.append(xi_LE_minus)
+                predictions_parts.append(xi_LE_plus)
 
         # LP predictions
-        for bin_idx in range(n_p_bins):
-            Cl_LP_vals = vmap(
-                lambda ell: self.compute_Cl_LP_jax(
-                    Om, s8, ell, bin_idx, w0=w0, wa=wa))(ell_grid)
+        if 'LP' in self.probes:
+            for bin_idx in range(n_p_bins):
+                Cl_LP_vals = vmap(
+                    lambda ell: self.compute_Cl_LP_jax(
+                        Om, s8, ell, bin_idx, w0=w0, wa=wa))(ell_grid)
 
-            xi_LP = self._bin_average(
-                self.hankel_j2(Cl_LP_vals, ell_grid, self.nodes_LP[bin_idx]),
-                self.w_LP[bin_idx])
-            predictions_parts.append(xi_LP)
+                xi_LP = self._bin_average(
+                    self.hankel_j2(
+                        Cl_LP_vals, ell_grid, self.nodes_LP[bin_idx]),
+                    self.w_LP[bin_idx])
+                predictions_parts.append(
+                    position_bias_amplitudes[bin_idx] * xi_LP
+                )
 
         # EE predictions: all shear bin pairs (i, j) with i >= j, in loscov's
         # enumeration order, each pair with its own SNR-optimised angular bins
@@ -1716,7 +1840,9 @@ class TheoryJAX:
                 xi_EP = self._bin_average(
                     self.hankel_j2(Cl_EP_vals, ell_grid, self.nodes_EP[k]),
                     self.w_EP[k])
-                predictions_parts.append(xi_EP)
+                predictions_parts.append(
+                    position_bias_amplitudes[j] * xi_EP
+                )
 
         # PP predictions (auto-bin galaxy clustering)
         # w(theta) is scalar x scalar, so the Hankel transform uses J0
@@ -1730,7 +1856,9 @@ class TheoryJAX:
                 xi_PP = self._bin_average(
                     self.hankel_j0(Cl_PP_vals, ell_grid, self.nodes_PP[k]),
                     self.w_PP[k])
-                predictions_parts.append(xi_PP)
+                predictions_parts.append(
+                    position_bias_amplitudes[b] ** 2 * xi_PP
+                )
 
         return jnp.concatenate(predictions_parts)
 

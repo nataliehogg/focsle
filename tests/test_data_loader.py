@@ -1,6 +1,8 @@
 """Tests for data loading utilities."""
 
 import numpy as np
+import hashlib
+import json
 import pytest
 import tempfile
 from pathlib import Path
@@ -144,3 +146,32 @@ def test_redshift_pickling_shim_pb():
     assert pb_in > 0.0
     assert pb_out == 0.0
     assert pb_bad_bin == 0.0
+
+
+
+def test_manifested_redshift_distribution(tmp_path):
+    """Current LOSCOV dictionary pickles are validated and unwrapped."""
+    from focsle.data_loader import detect_nbins, load_redshift_distributions
+
+    distribution = MockDistribution(1)
+
+    manifest = {'scenario': 'cosmos-web', 'version': 1}
+    canonical = json.dumps(
+        manifest, sort_keys=True, separators=(',', ':'), ensure_ascii=True
+    ).encode('utf-8')
+    packed = {
+        'E': distribution,
+        'P': distribution,
+        '__loscov_artifact_manifest__': {
+            'manifest_schema_version': 1,
+            'fingerprint': hashlib.sha256(canonical).hexdigest(),
+            'manifest': manifest,
+        },
+    }
+    with (tmp_path / 'redshift_distributions').open('wb') as output:
+        pickle.dump(packed, output)
+
+    loaded = load_redshift_distributions(tmp_path)
+    assert set(loaded) == {'E', 'P'}
+    assert detect_nbins(tmp_path) == 1
+    assert loaded['E'].Nbinz == 1

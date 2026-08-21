@@ -99,6 +99,37 @@ def main():
     )
 
     parser.add_argument(
+        '--fiducial-w0',
+        type=float,
+        default=-1.0,
+        help='Fiducial CPL w0 value (default: -1.0)'
+    )
+
+    parser.add_argument(
+        '--fiducial-wa',
+        type=float,
+        default=0.0,
+        help='Fiducial CPL wa value (default: 0.0)'
+    )
+
+    parser.add_argument(
+        '--fiducial-omega-m',
+        type=float,
+        default=None,
+        help=(
+            'Fiducial Omega_m value (default: value derived from the '
+            'baseline physical densities)'
+        )
+    )
+
+    parser.add_argument(
+        '--fiducial-sigma8',
+        type=float,
+        default=None,
+        help='Fiducial sigma_8 value (default: 0.7913)'
+    )
+
+    parser.add_argument(
         '--theta-min-arcmin',
         type=float,
         default=None,
@@ -185,9 +216,16 @@ def main():
         print("=" * 70)
 
     # Initialize forecast
+    cosmo_fid = {'w0': args.fiducial_w0, 'wa': args.fiducial_wa}
+    if args.fiducial_omega_m is not None:
+        cosmo_fid['Omega_m'] = args.fiducial_omega_m
+    if args.fiducial_sigma8 is not None:
+        cosmo_fid['sigma8'] = args.fiducial_sigma8
+
     forecast = FisherForecast(
         data_dir=args.data_dir,
         lens_file=args.lens_file,
+        cosmo_fid=cosmo_fid,
         verbose=verbose
     )
 

@@ -1,9 +1,22 @@
 #!/usr/bin/env python
-"""Plot DES, Planck, Euclid, and COSMOS-Web LLLELP constraints."""
+"""Figure 1 (left panel) for the URF proposal.
+
+Proposal-only copy of LLLELP_des_planck_contours.py. Differences:
+
+  * writes into the URF proposal figures directory
+  * DES Y3 and Planck 2018 are backgrounded in grey (dashed / dot-dashed)
+  * the Euclid DR3 LOS shear forecast is opaque, bold and drawn last
+  * relabelled "(this work)" so the key contour is obviously the applicant's
+  * no COSMOS-Web contour; axis limits zoomed back to the proposal range
+
+Do not repoint this at the 6x2pt figures directory: the other script owns
+that output.
+"""
 
 import sys
 from pathlib import Path
 
+import matplotlib.lines as mlines
 import matplotlib.patches as mpatches
 import matplotlib.pyplot as plt
 import numpy as np
@@ -14,7 +27,6 @@ from chainconsumer.plotting import plot_contour
 
 ROOT = Path(__file__).resolve().parents[1]
 URF_ROOT = Path('/home/nataliehogg/Documents/Applications/2026/URF')
-STT_ROOT = Path('/home/nataliehogg/Documents/Projects/6x2pt/figures')
 sys.path.insert(0, str(ROOT / 'src'))
 
 from focsle.fisher import FisherForecast
@@ -26,16 +38,7 @@ try:
 except OSError:
     pass
 
-# from matplotlib import rc
-
-# rc('text', usetex=True)
-# rc('font', family='serif', size=11)
-
-# cool = ['#41b6c4', '#2c7fb8', '#253494']
-# warm = ['#fdcc8a', '#fc8d59', '#d7301f']
-
-from sanglier.palettes import warm, cool, green, purple
-
+from sanglier.palettes import warm, green, cool, purple
 
 
 DES_CHAIN_FILE = ROOT / 'data' / 'chain_3x2pt_lcdm_SR_maglim.txt'
@@ -56,16 +59,29 @@ RESULTS_FILE = (
       'Nbin_max=20_nsamp=1e6_audited_060726_As_matched.pkl'
 )
 
-COSMOS_RESULTS_FILE = (
-    ROOT / 'results' / 'fisher_results_cosmos_web_lllelp.pkl'
-)
-
-OUTPUT_FILE = (STT_ROOT/'LLLELP_des_planck_contours.pdf'
-    #URF_ROOT / 'proposal' / 'figures' / 'LLLELP_des_planck_contours.pdf'
+OUTPUT_FILE = (
+    URF_ROOT
+    / 'application'
+    / 'proposal'
+    / 'figures'
+    / 'LLLELP_des_planck_contours.pdf'
 )
 
 OMEGA_M_LABEL = r'$\Omega_{\rm m}$'
 SIGMA_8_LABEL = r'$\sigma_8$'
+
+# Backgrounded probes: two greys so they stay separable in greyscale print,
+# reinforced by the dash pattern.
+DES_GREY = 'k'
+PLANCK_GREY = 'k'
+DES_LINESTYLE = '--'
+PLANCK_LINESTYLE = '-'
+
+# Key result. text.usetex is True (set in the sanglier style), so \textbf is
+# the only way to get bold here: matplotlib ignores fontweight for usetex text.
+# Split over two lines to fit the panel width.
+LOS_COLOUR = purple[2]
+LOS_LABEL = r'Euclid with LOS shear \textbf{(this proposal)}'
 
 
 def load_des_chain(path):
@@ -152,11 +168,13 @@ des_chain = make_chain(
     des_weights,
     name=r'DES Y3 $3\times2$pt',
     shade=True,
-    color=cool[1],
+    shade_alpha=0.05,
+    shade_gradient=0.2,
+    color=DES_GREY,
+    linestyle=DES_LINESTYLE,
     smooth=10,
     bins=20,
-    shade_gradient=0.8,
-    linewidth=2.0,
+    linewidth=1.6,
     zorder=20,
 )
 
@@ -166,11 +184,13 @@ planck_chain = make_chain(
     planck_weights,
     name=r'Planck 2018 TTTEEE+lowE',
     shade=True,
-    color=purple[2],
+    shade_alpha=0.05,
+    shade_gradient=0.2,
+    color=PLANCK_GREY,
+    linestyle=PLANCK_LINESTYLE,
     smooth=10,
     bins=20,
-    shade_gradient=0.8,
-    linewidth=2.0,
+    linewidth=1.6,
     zorder=30,
 )
 
@@ -178,81 +198,101 @@ results = FisherForecast.load_results(RESULTS_FILE)
 fisher_lllelp = results['fisher_matrices']['Combined']
 fiducial = tuple(results['fiducial'])
 
-
-cosmos_results = FisherForecast.load_results(COSMOS_RESULTS_FILE)
-fisher_cosmos = cosmos_results['fisher_matrices']['Combined']
-cosmos_fiducial = tuple(cosmos_results['fiducial'])
 fom_des = figure_of_merit(des_omega_m, des_sigma_8, des_weights)
 fom_planck = figure_of_merit(planck_omega_m, planck_sigma_8, planck_weights)
 fom_forecast = np.sqrt(np.linalg.det(fisher_lllelp))
 
-fom_cosmos = np.sqrt(np.linalg.det(fisher_cosmos))
 print(f'FoM DES Y3 3x2pt:          {fom_des:.1f}')
 print(f'FoM Planck 2018 TTTEEE:    {fom_planck:.1f}')
 print(f'FoM Euclid LOS (forecast): {fom_forecast:.1f}')
+print(f'  improvement over DES Y3: {fom_forecast / fom_des:.1f}x')
+print(f'  improvement over Planck: {fom_forecast / fom_planck:.1f}x')
 
-print(f'FoM COSMOS-Web LLLELP:     {fom_cosmos:.1f}')
-fig, ax = plt.subplots(figsize=(5.2, 4.6))
+# \textwidth is 517.84pt = 7.165in, and the proposal includes this at
+# width=0.44\textwidth, so the panel is drawn at exactly its final size and
+# saved without a tight bbox: LaTeX then scales it by 1.0 and every font size
+# set below is the size it prints at.
+FIGURE_WIDTH_IN = 0.44 * 517.84 / 72.27
+
+fig, ax = plt.subplots(figsize=(FIGURE_WIDTH_IN, FIGURE_WIDTH_IN))
 
 plot_contour(ax, des_chain, px=OMEGA_M_LABEL, py=SIGMA_8_LABEL)
 plot_contour(ax, planck_chain, px=OMEGA_M_LABEL, py=SIGMA_8_LABEL)
 
-
-plot_fisher_ellipse(
-    fisher_cosmos,
-    cosmos_fiducial,
-    ax,
-    color=green[2],
-    label=r'COSMOS-Web LLLELP',
-    show_2sigma=True,
-    zorder=10,
-)
+# Drawn last, opaque, and with a high zorder so nothing washes over it.
 plot_fisher_ellipse(
     fisher_lllelp,
     fiducial,
     ax,
-    color=warm[2],
-    label=r'Euclid DR3 LLLELP',
+    color=LOS_COLOUR,
+    label=LOS_LABEL,
+    alpha_1sig=0.85,
+    alpha_2sig=0.45,
     show_2sigma=True,
     zorder=100,
 )
 
-ax.set_xlim(0.05, 0.58)
-ax.set_ylim(0.50, 1.08)
-ax.set_xlabel(OMEGA_M_LABEL, fontsize=9)
-ax.set_ylabel(SIGMA_8_LABEL, fontsize=9)
-ax.tick_params(labelsize=9)
+# Centre the panel on the forecast fiducial so the key contour sits in the
+# middle of the frame rather than off to one side. Half-widths keep the
+# original spans (0.04 in Omega_m, 0.08 in sigma_8).
+OMEGA_M_HALF_WIDTH = 0.03
+SIGMA_8_HALF_WIDTH = 0.06 #.04
+
+ax.set_xlim(fiducial[0] - OMEGA_M_HALF_WIDTH, fiducial[0] + OMEGA_M_HALF_WIDTH)
+ax.set_ylim(fiducial[1] - SIGMA_8_HALF_WIDTH, fiducial[1] + SIGMA_8_HALF_WIDTH)
+ax.set_xlabel(OMEGA_M_LABEL, fontsize=10)
+ax.set_ylabel(SIGMA_8_LABEL, fontsize=10)
+ax.tick_params(labelsize=8)
 ax.set_box_aspect(1)
 
-
+# Key result listed first: reading order carries importance.
 legend_handles = [
-
     mpatches.Patch(
-        color=cool[1],
-        alpha=0.6,
-        label=r'DES Y3 EEEPPP',
+        facecolor=LOS_COLOUR,
+        edgecolor=LOS_COLOUR,
+        alpha=0.85,
+        label=LOS_LABEL,
     ),
-    mpatches.Patch(
-        color=purple[2],
-        alpha=0.6,
+    mlines.Line2D(
+        [], [],
+        color=DES_GREY,
+        linestyle=DES_LINESTYLE,
+        linewidth=1.6,
+        label=r'DES Y3 $3\times2$pt',
+    ),
+    mlines.Line2D(
+        [], [],
+        color=PLANCK_GREY,
+        linestyle=PLANCK_LINESTYLE,
+        linewidth=1.6,
         label=r'Planck 2018 TTTEEE+lowE',
     ),
-    mpatches.Patch(
-        color=warm[2],
-        alpha=0.6,
-        label=r'Euclid DR3 LLLELP',
-    ),
-    mpatches.Patch(
-        color=green[2],
-        alpha=0.6,
-        label=r'COSMOS-Web LLLELP',
-    ),
 ]
-ax.legend(handles=legend_handles, loc='upper right', fontsize=8, frameon=False)
+# Centring on the fiducial pushes the Planck/DES contours through the upper
+# corners, so the legend moves to the empty lower left and gets an opaque
+# backing box to stay readable wherever the contours run.
+legend = ax.legend(
+    handles=legend_handles,
+    # loc='lower left',
+    loc='lower center',
+    fontsize=7.5,
+    frameon=True,
+    facecolor='white',
+    edgecolor='none',
+    framealpha=0.9,
+    labelspacing=0.5,
+    handlelength=1.8,
+    borderaxespad=0.4,
+).set_zorder(300)
+legend = ax.get_legend()
 
-fig.tight_layout()
+# set_color is a matplotlib property, so it still applies under usetex: the
+# key entry is bold *and* carries the contour colour.
+# legend.get_texts()[0].set_color(LOS_COLOUR)
+
+fig.tight_layout(pad=0.3)
 OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
-fig.savefig(OUTPUT_FILE, bbox_inches='tight')
+fig.savefig(OUTPUT_FILE)
 plt.close(fig)
 
 print(f'Saved to {OUTPUT_FILE}')

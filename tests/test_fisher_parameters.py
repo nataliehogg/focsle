@@ -105,6 +105,58 @@ def test_parameter_subset_holds_omitted_values_fixed():
     )
 
 
+def test_position_bias_parameters_are_differentiated_per_bin():
+    class BiasTheory:
+        cosmo_fid = {
+            "Omega_m": 0.3,
+            "sigma8": 0.8,
+            "w0": -1.0,
+            "wa": 0.0,
+        }
+        Nbinz_P = 2
+
+        def predict_data_vector_jax(
+            self, Omega_m, sigma_8, ell_grid=None, w0=None, wa=None,
+            position_bias_amplitudes=None,
+        ):
+            b0, b1 = position_bias_amplitudes
+            return jnp.stack((Omega_m * b0, sigma_8 * b1, b0 ** 2, b1 ** 2))
+
+        @staticmethod
+        def prediction_sizes():
+            return {"EP": 2, "PP": 2}
+
+    forecast = FisherForecast.__new__(FisherForecast)
+    forecast._is_setup = True
+    forecast.verbose = False
+    forecast.theory = BiasTheory()
+    forecast.param_names = ["Omega_m", "sigma_8"]
+    forecast.sizes = {"n_EP": 2, "n_PP": 2}
+    forecast.C_full = np.eye(4)
+    forecast.C_inv = np.eye(4)
+    forecast.C_EP_inv = np.eye(2)
+    forecast.C_PP_inv = np.eye(2)
+    forecast.fisher_matrices = {}
+    forecast.constraints = {}
+    forecast.jacobian = None
+
+    names = ["Omega_m", "sigma_8", "bias_P_0", "bias_P_1"]
+    results = forecast.compute_fisher(names)
+
+    expected_jacobian = np.array([
+        [1.0, 0.0, 0.3, 0.0],
+        [0.0, 1.0, 0.0, 0.8],
+        [0.0, 0.0, 2.0, 0.0],
+        [0.0, 0.0, 0.0, 2.0],
+    ])
+    np.testing.assert_allclose(forecast.jacobian, expected_jacobian)
+    np.testing.assert_allclose(
+        results["fisher_matrices"]["Combined"],
+        expected_jacobian.T @ expected_jacobian,
+    )
+    np.testing.assert_allclose(results["fiducial"], [0.3, 0.8, 1.0, 1.0])
+
+
 def test_dark_energy_cannot_be_added_after_two_parameter_setup():
     forecast = _linear_forecast()
     forecast.theory = object()

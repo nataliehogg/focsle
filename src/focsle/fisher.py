@@ -66,6 +66,7 @@ class FisherForecast:
     """
 
     SUPPORTED_PARAMETERS = ('Omega_m', 'sigma_8', 'w0', 'wa')
+    POSITION_BIAS_PREFIX = 'bias_P_'
     DEFAULT_PARAMETERS = ('Omega_m', 'sigma_8')
     _FIDUCIAL_KEYS = {
         'Omega_m': 'Omega_m',
@@ -142,8 +143,11 @@ class FisherForecast:
         names = list(param_names)
         if not names:
             raise ValueError("At least one forecast parameter is required")
-        unknown = [name for name in names
-                   if name not in cls.SUPPORTED_PARAMETERS]
+        unknown = [
+            name for name in names
+            if (name not in cls.SUPPORTED_PARAMETERS
+                and cls._position_bias_index(name) is None)
+        ]
         if unknown:
             raise ValueError(
                 f"Unsupported forecast parameter(s): {unknown}; choose from "
@@ -153,10 +157,30 @@ class FisherForecast:
             raise ValueError("Forecast parameter names must not be repeated")
         return names
 
+    @classmethod
+    def _position_bias_index(cls, name: str) -> Optional[int]:
+        """Return the P-bin index encoded by a galaxy-bias nuisance name."""
+        if not isinstance(name, str) or not name.startswith(
+            cls.POSITION_BIAS_PREFIX
+        ):
+            return None
+        suffix = name[len(cls.POSITION_BIAS_PREFIX):]
+        if not suffix.isdigit():
+            return None
+        return int(suffix)
+
     def _fiducial_for(self, param_names: List[str]) -> List[float]:
         """Return fiducial values in exactly the requested parameter order."""
-        return [float(self.theory.cosmo_fid[self._FIDUCIAL_KEYS[name]])
-                for name in param_names]
+        fiducial = []
+        for name in param_names:
+            bias_index = self._position_bias_index(name)
+            if bias_index is not None:
+                fiducial.append(1.0)
+            else:
+                fiducial.append(float(
+                    self.theory.cosmo_fid[self._FIDUCIAL_KEYS[name]]
+                ))
+        return fiducial
 
     def setup(self, nOm: int = 5, nAs: int = 5, nz: int = 50, nk: int = 100,
               Om_range: Tuple[float, float] = (0.25, 0.40),
@@ -207,6 +231,9 @@ class FisherForecast:
             nOm=nOm, nAs=nAs, nz=nz, nk=nk,
             verbose=self.verbose
         )
+        self.theory.configure_survey_range(
+            str(self.data_dir), verbose=self.verbose
+        )
 
         # The distance-dependent galaxy kernels must see the response
         # tables during their precomputation, so this ordering is required.
@@ -219,6 +246,17 @@ class FisherForecast:
         if self.verbose:
             print("\nLoading galaxy distributions...")
         self.theory.setup_galaxy_distributions(str(self.data_dir), verbose=self.verbose)
+
+        invalid_biases = [
+            name for name in self.param_names
+            if ((index := self._position_bias_index(name)) is not None
+                and index >= self.theory.Nbinz_P)
+        ]
+        if invalid_biases:
+            raise ValueError(
+                f'Position-bias parameters exceed the '
+                f'{self.theory.Nbinz_P} available P bins: {invalid_biases}'
+            )
 
         # Load angular bins
         if self.verbose:
@@ -261,12 +299,10 @@ class FisherForecast:
             self.C_full, self.sizes = build_full_covariance(self.cov_blocks)
         if self.verbose:
             print(f"  Shape: {self.C_full.shape}")
-            size_str = f"  Data vector sizes: n_LL={self.sizes['n_LL']}, " \
-                      f"n_LE={self.sizes['n_LE']}, n_LP={self.sizes['n_LP']}"
-            if 'n_EE' in self.sizes:
-                size_str += f", n_EE={self.sizes['n_EE']}, n_EP={self.sizes['n_EP']}, " \
-                           f"n_PP={self.sizes['n_PP']}"
-            print(size_str)
+            size_str = ', '.join(
+                f'{key}={value}' for key, value in self.sizes.items()
+            )
+            print(f"  Data vector sizes: {size_str}")
 
         # Invert covariance
         if self.verbose:
@@ -294,55 +330,21 @@ class FisherForecast:
         # Pre-compute block inverses for Fisher matrix computation (avoids redundant inversions)
         if self.verbose:
             print("Pre-computing covariance block inverses...")
-        n_LL = self.sizes['n_LL']
-        n_LE = self.sizes['n_LE']
-        n_LP = self.sizes['n_LP']
-
-        self.C_LL_inv = self._robust_symmetric_inverse(
-            self.C_full[:n_LL, :n_LL],
-            verbose=False, label='LLLL'
-        )
-        self.C_LE_inv = self._robust_symmetric_inverse(
-            self.C_full[n_LL:n_LL + n_LE, n_LL:n_LL + n_LE],
-            verbose=False, label='LELE'
-        )
-        self.C_LP_inv = self._robust_symmetric_inverse(
-            self.C_full[n_LL + n_LE:n_LL + n_LE + n_LP, n_LL + n_LE:n_LL + n_LE + n_LP],
-            verbose=False, label='LPLP'
-        )
-
-        # Check if new blocks exist (6-probe case)
-        if 'n_EE' in self.sizes:
-            n_EE = self.sizes['n_EE']
-            n_EP = self.sizes['n_EP']
-            n_PP = self.sizes['n_PP']
-
-            # Compute EE block inverse
-            start_EE = n_LL + n_LE + n_LP
-            self.C_EE_inv = self._robust_symmetric_inverse(
-                self.C_full[start_EE:start_EE + n_EE, start_EE:start_EE + n_EE],
-                verbose=False, label='EEEE'
+        offset = 0
+        for size_key, size in self.sizes.items():
+            probe = size_key[2:]
+            block = self.C_full[offset:offset + size, offset:offset + size]
+            setattr(
+                self,
+                f'C_{probe}_inv',
+                self._robust_symmetric_inverse(
+                    block, verbose=False, label=probe + probe
+                ),
             )
+            offset += size
 
-            # Compute EP block inverse
-            start_EP = start_EE + n_EE
-            self.C_EP_inv = self._robust_symmetric_inverse(
-                self.C_full[start_EP:start_EP + n_EP, start_EP:start_EP + n_EP],
-                verbose=False, label='EPEP'
-            )
-
-            # Compute PP block inverse
-            start_PP = start_EP + n_EP
-            self.C_PP_inv = self._robust_symmetric_inverse(
-                self.C_full[start_PP:, start_PP:],
-                verbose=False, label='PPPP'
-            )
-
-            if self.verbose:
-                print("  All block inverses cached (including EE, EP, PP)!")
-        else:
-            if self.verbose:
-                print("  Block inverses cached!")
+        if self.verbose:
+            print(f"  Cached inverses for: {', '.join(key[2:] for key in self.sizes)}")
 
         self._is_setup = True
         if self.verbose:
@@ -369,6 +371,19 @@ class FisherForecast:
             param_names = self._normalise_param_names(param_names)
 
         use_dark_energy = any(name in ('w0', 'wa') for name in param_names)
+        position_bias_parameters = {
+            name: self._position_bias_index(name) for name in param_names
+            if self._position_bias_index(name) is not None
+        }
+        invalid_biases = [
+            name for name, index in position_bias_parameters.items()
+            if index >= self.theory.Nbinz_P
+        ]
+        if invalid_biases:
+            raise ValueError(
+                f'Position-bias parameters exceed the '
+                f'{self.theory.Nbinz_P} available P bins: {invalid_biases}'
+            )
         if use_dark_energy and not hasattr(self.theory, 'dlnPk_dw0'):
             raise RuntimeError(
                 "w0/wa were requested after a two-parameter setup; rerun "
@@ -404,15 +419,30 @@ class FisherForecast:
                 name: self.theory.cosmo_fid[key]
                 for name, key in self._FIDUCIAL_KEYS.items()
             }
+            position_bias = (
+                jnp.ones(self.theory.Nbinz_P)
+                if position_bias_parameters else None
+            )
             for index, name in enumerate(self.param_names):
-                values[name] = params[index]
+                bias_index = self._position_bias_index(name)
+                if bias_index is None:
+                    values[name] = params[index]
+                else:
+                    position_bias = position_bias.at[bias_index].set(
+                        params[index]
+                    )
+            prediction_kwargs = {}
+            if position_bias_parameters:
+                prediction_kwargs['position_bias_amplitudes'] = position_bias
             if use_dark_energy:
                 return self.theory.predict_data_vector_jax(
                     values['Omega_m'], values['sigma_8'],
                     w0=values['w0'], wa=values['wa'],
+                    **prediction_kwargs,
                 )
             return self.theory.predict_data_vector_jax(
-                values['Omega_m'], values['sigma_8']
+                values['Omega_m'], values['sigma_8'],
+                **prediction_kwargs,
             )
 
         params_fid = jnp.array(fiducial)
@@ -450,105 +480,32 @@ class FisherForecast:
         # Convert covariance inverse to JAX
         C_inv_jax = jnp.array(self.C_inv)
 
-        # Extract sizes
-        n_LL = self.sizes['n_LL']
-        n_LE = self.sizes['n_LE']
-        n_LP = self.sizes['n_LP']
-
         # Compute Fisher for each probe
         if self.verbose:
             print("\n" + "-" * 50)
             print("Computing Fisher matrices for individual probes")
             print("-" * 50)
 
-        # LL only (using pre-computed inverse)
-        if self.verbose:
-            print("\n1. LL only:")
-        J_LL = self.jacobian[:n_LL, :]
-        C_LL_inv = jnp.array(self.C_LL_inv)
-        F_LL = J_LL.T @ C_LL_inv @ J_LL
-        self.fisher_matrices['LL'] = np.array(F_LL)
-        self.constraints['LL'] = self._analyze_constraints(
-            self.fisher_matrices['LL'], fiducial
-        )
-        self._print_constraints('LL')
-
-        # LE only (using pre-computed inverse)
-        if self.verbose:
-            print("\n2. LE only:")
-        J_LE = self.jacobian[n_LL:n_LL + n_LE, :]
-        C_LE_inv = jnp.array(self.C_LE_inv)
-        F_LE = J_LE.T @ C_LE_inv @ J_LE
-        self.fisher_matrices['LE'] = np.array(F_LE)
-        self.constraints['LE'] = self._analyze_constraints(
-            self.fisher_matrices['LE'], fiducial
-        )
-        self._print_constraints('LE')
-
-        # LP only (using pre-computed inverse)
-        if self.verbose:
-            print("\n3. LP only:")
-        J_LP = self.jacobian[n_LL + n_LE:n_LL + n_LE + n_LP, :]
-        C_LP_inv = jnp.array(self.C_LP_inv)
-        F_LP = J_LP.T @ C_LP_inv @ J_LP
-        self.fisher_matrices['LP'] = np.array(F_LP)
-        self.constraints['LP'] = self._analyze_constraints(
-            self.fisher_matrices['LP'], fiducial
-        )
-        self._print_constraints('LP')
-
-        # Check if new probes exist (6-probe case)
-        if 'n_EE' in self.sizes:
-            n_EE = self.sizes['n_EE']
-            n_EP = self.sizes['n_EP']
-            # n_PP = self.sizes['n_PP']
-
-            # EE only
+        offset = 0
+        for index, (size_key, size) in enumerate(self.sizes.items(), start=1):
+            probe = size_key[2:]
             if self.verbose:
-                print("\n4. EE only:")
-            start_EE = n_LL + n_LE + n_LP
-            J_EE = self.jacobian[start_EE:start_EE + n_EE, :]
-            C_EE_inv = jnp.array(self.C_EE_inv)
-            F_EE = J_EE.T @ C_EE_inv @ J_EE
-            self.fisher_matrices['EE'] = np.array(F_EE)
-            self.constraints['EE'] = self._analyze_constraints(
-                self.fisher_matrices['EE'], fiducial
+                print(f"\n{index}. {probe} only:")
+            jacobian_probe = self.jacobian[offset:offset + size, :]
+            covariance_inverse = jnp.array(getattr(self, f'C_{probe}_inv'))
+            fisher_probe = (
+                jacobian_probe.T @ covariance_inverse @ jacobian_probe
             )
-            self._print_constraints('EE')
-
-            # EP only
-            if self.verbose:
-                print("\n5. EP only:")
-            start_EP = start_EE + n_EE
-            J_EP = self.jacobian[start_EP:start_EP + n_EP, :]
-            C_EP_inv = jnp.array(self.C_EP_inv)
-            F_EP = J_EP.T @ C_EP_inv @ J_EP
-            self.fisher_matrices['EP'] = np.array(F_EP)
-            self.constraints['EP'] = self._analyze_constraints(
-                self.fisher_matrices['EP'], fiducial
+            self.fisher_matrices[probe] = np.array(fisher_probe)
+            self.constraints[probe] = self._analyze_constraints(
+                self.fisher_matrices[probe], fiducial
             )
-            self._print_constraints('EP')
+            self._print_constraints(probe)
+            offset += size
 
-            # PP only
-            if self.verbose:
-                print("\n6. PP only:")
-            start_PP = start_EP + n_EP
-            J_PP = self.jacobian[start_PP:, :]
-            C_PP_inv = jnp.array(self.C_PP_inv)
-            F_PP = J_PP.T @ C_PP_inv @ J_PP
-            self.fisher_matrices['PP'] = np.array(F_PP)
-            self.constraints['PP'] = self._analyze_constraints(
-                self.fisher_matrices['PP'], fiducial
-            )
-            self._print_constraints('PP')
-
-            # Combined (all 6 probes)
-            if self.verbose:
-                print("\n7. Combined (all 6 probes: LL + LE + LP + EE + EP + PP):")
-        else:
-            # Combined (3 probes only)
-            if self.verbose:
-                print("\n4. Combined (LL + LE + LP):")
+        if self.verbose:
+            probes = ' + '.join(key[2:] for key in self.sizes)
+            print(f"\n{len(self.sizes) + 1}. Combined ({probes}):")
 
         # Full-covariance combined Fisher: F = J^T C^+ J, where C^+ is the
         # pseudo-inverse of the full covariance (noise-floor modes projected
@@ -569,14 +526,9 @@ class FisherForecast:
         # Note this is not a bound in either direction: correlations between
         # probes can remove information (shared sample variance) or add it
         # (correlated-noise cancellation between probes).
-        F_independent = (self.fisher_matrices['LL'] +
-                         self.fisher_matrices['LE'] +
-                         self.fisher_matrices['LP'])
-        if 'n_EE' in self.sizes:
-            F_independent = (F_independent +
-                             self.fisher_matrices['EE'] +
-                             self.fisher_matrices['EP'] +
-                             self.fisher_matrices['PP'])
+        F_independent = sum(
+            self.fisher_matrices[key[2:]] for key in self.sizes
+        )
         self.fisher_matrices['Combined_independent'] = F_independent
         self.constraints['Combined_independent'] = self._analyze_constraints(
             F_independent, fiducial
@@ -893,7 +845,7 @@ class FisherForecast:
             print("   WARNING: Fisher matrix is singular!")
             return
         for index, name in enumerate(self.param_names):
-            label = self._PRINT_LABELS[name]
+            label = self._PRINT_LABELS.get(name, name)
             error = results['errors'][index]
             fractional = results['fractional_errors'][index]
             if np.isfinite(fractional):
@@ -926,17 +878,11 @@ class FisherForecast:
             'timestamp': datetime.now().isoformat(),
             'data_dir': str(self.data_dir),
             'dataset_info': self.dataset_info,
-            'n_LL': self.sizes['n_LL'],
-            'n_LE': self.sizes['n_LE'],
-            'n_LP': self.sizes['n_LP'],
             'nbins': self.nbins,
             'param_names': list(self.param_names),
+            'cosmo_fid': dict(self.theory.cosmo_fid),
         }
-        # Add new probe sizes if they exist
-        if 'n_EE' in self.sizes:
-            metadata['n_EE'] = self.sizes['n_EE']
-            metadata['n_EP'] = self.sizes['n_EP']
-            metadata['n_PP'] = self.sizes['n_PP']
+        metadata.update(self.sizes)
 
         results_dict = {
             'fisher_matrices': self.fisher_matrices,
